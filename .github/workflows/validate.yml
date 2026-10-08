@@ -1,0 +1,47 @@
+name: Validate GSCS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check UI JavaScript
+        run: node --check ui.js
+      - name: Check shaders, payload integrity and HTML module
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64, gzip, io, json, re, zipfile
+          html = Path('index.html').read_text()
+          assert 'window.__gscsParts=' in html
+          for name, count in [('engine', 3), ('splat', 22)]:
+              paths = sorted(Path('payload').glob(f'{name}-*.txt'))
+              assert len(paths) == count, (name, len(paths))
+              raw = base64.b64decode(''.join(p.read_text() for p in paths), validate=True)
+              if name == 'engine':
+                  assert len(gzip.decompress(raw)) > 1000000
+              else:
+                  archive = zipfile.ZipFile(io.BytesIO(raw))
+                  assert archive.testzip() is None
+                  assert 'meta.json' in archive.namelist()
+          shader = re.search(r'const MODIFIER_GLSL = (".*?");\s*const FRAGMENT_GLSL', html, re.S)
+          assert shader is not None
+          code = json.loads(shader.group(1))
+          names = ['sfxMcmc','sfxDiffusion','sfxCurlFlow','sfxHarmonic','sfxVortex','sfxShockwave','sfxShatter','sfxPhyllotaxis','sfxWipe','sfxMelt','sfxWind','sfxChladni','sfxNBody','sfxLattice','sfxHelix','sfxBeamUp','sfxFibSphere','sfxTornado']
+          for name in names:
+              assert 'vec3 ' + name + '(' in code, name
+          module = re.search(r'<script type="module">([\s\S]*?)</script>', html)
+          assert module
+          Path('/tmp/gscs-module.mjs').write_text(module.group(1))
+          print('PASS: 18 effects, payload files, valid .sog, valid gzip engine')
+          PY
+          node --check /tmp/gscs-module.mjs
