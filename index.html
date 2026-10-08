@@ -77,8 +77,25 @@ const fail = (e) => {
 };
 
 /** base64 text node -> bytes, chunked so a large capture stays responsive. */
-function decode(id) {
-    const b64 = document.getElementById(id).textContent.trim();
+async function decode(id) {
+    const inline = document.getElementById(id)?.textContent.trim() || '';
+    const kind = id === 'engine-payload' ? 'engine' : 'splat';
+    const urls = globalThis.__gscsParts?.[kind] || [];
+    let b64 = inline;
+    if (!b64) {
+        if (!urls.length) throw new Error('Faltan archivos del modelo o del motor: ' + kind);
+        let completed = 0;
+        const chunks = await Promise.all(urls.map(async (url) => {
+            const response = await fetch(url);
+            if (!response.ok) throw new Error('No se pudo cargar ' + url + ': HTTP ' + response.status);
+            const text = (await response.text()).trim();
+            completed++;
+            msgEl.textContent = 'Cargando ' + (kind === 'engine' ? 'motor' : 'modelo') +
+                ' · ' + Math.round(completed / urls.length * 100) + '%';
+            return text;
+        }));
+        b64 = chunks.join('');
+    }
     const bin = atob(b64);
     const out = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
