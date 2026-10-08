@@ -1,0 +1,955 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#101317">
+<title>GSCS — Gaussian Splat Transition Lab</title>
+<link rel="stylesheet" href="./ui.css">
+<style>
+:root { --safe-b: env(safe-area-inset-bottom, 0px); }
+* { box-sizing: border-box; }
+html, body {
+    margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none;
+    /* the canvas clears to transparent, so this is the scene's backdrop rather
+       than something behind an opaque viewport */
+    background: radial-gradient(ellipse at 50% 40%, #1f1029 0%, #09040d 100%);
+    color: #e3e7ec;
+    font: 13px/1.45 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased; touch-action: manipulation;
+}
+#view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+#hint {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    bottom: calc(18px + var(--safe-b));
+    padding: 7px 15px; border-radius: 999px;
+    font-size: 11px; color: #98a1ad; white-space: nowrap;
+    background: rgba(26, 30, 36, 0.86);
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    border: 1px solid rgba(176, 194, 216, 0.13);
+    pointer-events: none; transition: opacity 0.6s;
+}
+#boot {
+    position: fixed; inset: 0; z-index: 20;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+    background: radial-gradient(ellipse at 50% 40%, #1f1029 0%, #09040d 100%);
+    transition: opacity 0.4s;
+}
+.gone { opacity: 0; pointer-events: none; }
+#msg { font-size: 12px; color: #98a1ad; }
+#boot.fail #msg {
+    max-width: min(520px, calc(100vw - 32px)); padding: 14px 18px; color: #ff9f9f;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: rgba(255, 90, 90, 0.08); border: 1px solid rgba(255, 90, 90, 0.3);
+    border-radius: 10px; text-align: center; overflow-wrap: anywhere;
+}
+#boot.fail .spinner { display: none; }
+.spinner {
+    width: 26px; height: 26px; border: 2px solid rgba(176, 194, 216, 0.12);
+    border-top-color: #9dbdd4; border-radius: 50%; animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="hint">Arrastra para orbitar · rueda o pellizca para ampliar · espacio para reproducir</div>
+<div id="boot"><div class="spinner"></div><div id="msg">Unpacking…</div></div>
+
+<script src="./ui.js" defer></script>
+<script id="engine-payload" type="application/octet-stream"></script>
+<script id="splat-payload" type="application/octet-stream"></script>
+
+<script>window.__gscsParts={"engine":["./payload/engine-00.txt","./payload/engine-01.txt","./payload/engine-02.txt"],"splat":["./payload/splat-00.txt","./payload/splat-01.txt","./payload/splat-02.txt","./payload/splat-03.txt","./payload/splat-04.txt","./payload/splat-05.txt","./payload/splat-06.txt","./payload/splat-07.txt","./payload/splat-08.txt","./payload/splat-09.txt","./payload/splat-10.txt","./payload/splat-11.txt","./payload/splat-12.txt","./payload/splat-13.txt","./payload/splat-14.txt","./payload/splat-15.txt","./payload/splat-16.txt","./payload/splat-17.txt","./payload/splat-18.txt","./payload/splat-19.txt","./payload/splat-20.txt","./payload/splat-21.txt"]}</script>\n<script type="module">
+const CFG = {"filename":"bonsai01.sog","effectIndex":10,"params":{"point":3.5,"pointGain":2.2,"pointBlend":1,"falloff":0.4,"rim":0,"amp":1,"freq":1.2,"turb":0.45,"spin":1,"sizeGain":0.4,"fade":0.75,"glow":0.7,"tint":[0.85,0.95,1],"seed":7},"transition":{"duration":2.2,"easing":"ease in-out","dwell":0.9,"autoCycle":true,"advanceOnCycle":false},"camera":{"yaw":1008.3948400000089,"pitch":20,"autoRotate":6,"fov":45,"framing":{"fit":3.7,"min":0.15,"max":40}},"gz":{"engine":true,"splat":false}};
+const MODIFIER_GLSL = "\n\n#define SFX_PI      3.14159265359\n#define SFX_TAU     6.28318530718\n#define SFX_GOLDEN  2.39996322973   // golden angle, radians\n#define SFX_PLASTIC 1.32471795724   // plastic number, for the R2 sequence\n\n// ---------------------------------------------------------------- uniforms ---\n\nuniform float uTime;        // seconds\nuniform float uProg;        // 0 = fully assembled, 1 = fully dispersed\nuniform float uEffect;      // effect id\nuniform vec3  uPivot;       // world-space centroid of the splat cloud\nuniform float uExtent;      // world-space bounding radius\nuniform float uHeight;      // world-space vertical extent of the splat cloud\nuniform float uWidth;       // world-space horizontal extent, wider of X and Z\nuniform float uAmp;         // displacement amplitude\nuniform float uFreq;        // spatial frequency / band selector\nuniform float uTurb;        // secondary/turbulence term\nuniform float uSpin;        // angular term\nuniform float uSizeGain;    // covariance inflation / stretch\nuniform float uFade;        // how much opacity drops with dispersion\nuniform float uGlow;        // emissive edge energy\nuniform vec3  uTint;        // energy colour\nuniform float uSeed;        // reshuffles every hash\nuniform float uSplatCount;\nuniform float uPointSize;   // 0 = keep the native covariance; else point radius\nuniform float uPointGain;   // opacity gain that compensates for the lost area\nuniform float uPointBlend;  // 0 = points are absolute; else uProg of full points\n\n// ------------------------------------------------- per-splat shared state ---\n// Written by modifySplatCenter, consumed by modifySplatRotationScale and\n// modifySplatColor (which the engine calls later in the same invocation).\n// Initialised to identity values so a color-only pass can never corrupt output.\n\nfloat gDisp     = 0.0;   // 0..1 \"how dispersed am I\" -> drives fade/tint\nfloat gHide     = 0.0;   // 0..1 fraction of this splat that has been culled\nfloat gEdge     = 0.0;   // 0..1 proximity to a moving wavefront -> drives glow\nfloat gInflate  = 1.0;   // isotropic covariance multiplier\nfloat gStretch  = 0.0;   // anisotropic stretch amount along gVel\nfloat gAlphaComp = 1.0;  // energy compensation: alpha correction for area gain\nvec3  gVel      = vec3(0.0, 1.0, 0.0);  // stretch direction (world)\nvec4  gSpinQ    = vec4(0.0, 0.0, 0.0, 1.0);  // extra rigid rotation (x,y,z,w)\nbool  gMelt     = false; // principal-axis melt takes over the scale path\nuint  gSeed     = 0u;\n\n// ------------------------------------------------------------------ hashing ---\n\nuint sfxPcg(uint v) {\n    uint state = v * 747796405u + 2891336453u;\n    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;\n    return (word >> 22u) ^ word;\n}\n\n// Deterministic seed from an exact world position: stable across frames, so\n// every stochastic effect is temporally coherent without any ping-pong state.\nuint sfxSeedPos(vec3 p) {\n    uint a = floatBitsToUint(p.x);\n    uint b = floatBitsToUint(p.y);\n    uint c = floatBitsToUint(p.z);\n    return sfxPcg(a ^ sfxPcg(b ^ sfxPcg(c ^ floatBitsToUint(uSeed))));\n}\n\n// Advancing uniform in [0,1)\nfloat sfxRnd(inout uint s) {\n    s = sfxPcg(s);\n    return float(s) * (1.0 / 4294967296.0);\n}\n\nvec3 sfxHash33(vec3 p) {\n    uint s = sfxSeedPos(p);\n    return vec3(sfxRnd(s), sfxRnd(s), sfxRnd(s));\n}\n\n// Additive-recurrence (Weyl) low-discrepancy sequence, in fixed point.\n//\n// The textbook form is fract(i * alpha) for an irrational alpha, but that loses\n// its fractional bits in float32 once i is large: at i ~ 55k the product needs\n// 16 integer bits, leaving 8 for the fraction, so 165k splats collapse onto\n// ~256 distinct values and the sequence bands visibly. Multiplying in uint with\n// alpha scaled by 2^32 wraps exactly and keeps the full 32 bits.\nfloat sfxWeyl(uint i, uint alpha) {\n    return float(i * alpha) * (1.0 / 4294967296.0);\n}\n\n#define SFX_W_PHI 2654435769u    // round(2^32 / phi),  golden ratio\n#define SFX_W_R2A 3242174890u    // round(2^32 / g),    g = plastic number\n#define SFX_W_R2B 2447445413u    // round(2^32 / g^2)\n\n// Box-Muller: two independent standard normals from two uniforms.\nvec2 sfxGauss2(inout uint s) {\n    float u1 = max(sfxRnd(s), 1e-7);\n    float u2 = sfxRnd(s);\n    float r  = sqrt(-2.0 * log(u1));\n    return r * vec2(cos(SFX_TAU * u2), sin(SFX_TAU * u2));\n}\n\nvec3 sfxGauss3(inout uint s) {\n    vec2 ab = sfxGauss2(s);\n    return vec3(ab, sfxGauss2(s).x);\n}\n\n// -------------------------------------------------------------------- noise ---\n\n// Single-round lattice hash. 'i' is always an exact integer-valued float, so\n// the int cast is lossless. One PCG round per corner keeps the curl operator\n// (which needs 48 lattice hashes) affordable at 165k splats/frame.\nfloat sfxVal(vec3 i) {\n    uvec3 q = uvec3(ivec3(i));   // wraps mod 2^32 for negative lattice coords\n    uint h = q.x * 374761393u + q.y * 668265263u + q.z * 1274126177u;\n    return float(sfxPcg(h ^ floatBitsToUint(uSeed))) * (1.0 / 4294967296.0);\n}\n\n// Trilinear value noise, quintic-smoothed. Cheap and C1-continuous, which is\n// all the curl operator below needs.\nfloat sfxNoise(vec3 p) {\n    vec3 i = floor(p);\n    vec3 f = p - i;\n    vec3 w = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);\n\n    float n000 = sfxVal(i + vec3(0.0, 0.0, 0.0));\n    float n100 = sfxVal(i + vec3(1.0, 0.0, 0.0));\n    float n010 = sfxVal(i + vec3(0.0, 1.0, 0.0));\n    float n110 = sfxVal(i + vec3(1.0, 1.0, 0.0));\n    float n001 = sfxVal(i + vec3(0.0, 0.0, 1.0));\n    float n101 = sfxVal(i + vec3(1.0, 0.0, 1.0));\n    float n011 = sfxVal(i + vec3(0.0, 1.0, 1.0));\n    float n111 = sfxVal(i + vec3(1.0, 1.0, 1.0));\n\n    return mix(mix(mix(n000, n100, w.x), mix(n010, n110, w.x), w.y),\n               mix(mix(n001, n101, w.x), mix(n011, n111, w.x), w.y), w.z) * 2.0 - 1.0;\n}\n\nfloat sfxFbm(vec3 p) {\n    float a = 0.5, s = 0.0;\n    for (int i = 0; i < 4; ++i) {\n        s += a * sfxNoise(p);\n        p = p * 2.03 + vec3(11.7, -3.1, 5.9);\n        a *= 0.5;\n    }\n    return s;\n}\n\n// Two-octave fbm: the curl operator below evaluates psi six times, so this\n// stays deliberately cheap.\nfloat sfxFbm2(vec3 p) {\n    return 0.62 * sfxNoise(p) + 0.31 * sfxNoise(p * 2.03 + vec3(11.7, -3.1, 5.9));\n}\n\n// Vector potential psi. Three decorrelated fbm lobes.\nvec3 sfxPsi(vec3 p) {\n    return vec3(\n        sfxFbm2(p),\n        sfxFbm2(p + vec3(31.416, 17.0, -9.5)),\n        sfxFbm2(p - vec3(7.77, 44.1, 21.3))\n    );\n}\n\n// v = curl(psi). Divergence-free by construction, so advecting along it\n// preserves volume: the cloud shears and folds instead of inflating.\nvec3 sfxCurl(vec3 p, float eps) {\n    vec3 dx = vec3(eps, 0.0, 0.0);\n    vec3 dy = vec3(0.0, eps, 0.0);\n    vec3 dz = vec3(0.0, 0.0, eps);\n\n    vec3 px1 = sfxPsi(p + dx), px0 = sfxPsi(p - dx);\n    vec3 py1 = sfxPsi(p + dy), py0 = sfxPsi(p - dy);\n    vec3 pz1 = sfxPsi(p + dz), pz0 = sfxPsi(p - dz);\n\n    float k = 0.5 / eps;\n    return vec3(\n        (py1.z - py0.z) - (pz1.y - pz0.y),\n        (pz1.x - pz0.x) - (px1.z - px0.z),\n        (px1.y - px0.y) - (py1.x - py0.x)\n    ) * k;\n}\n\n// Worley / Voronoi: nearest jittered lattice site in the 3x3x3 neighbourhood.\nvoid sfxWorley(vec3 p, out vec3 site, out float dist, out float dist2) {\n    vec3 ip = floor(p);\n    float b1 = 1e9, b2 = 1e9;\n    vec3 best = ip;\n    for (int z = -1; z <= 1; ++z) {\n        for (int y = -1; y <= 1; ++y) {\n            for (int x = -1; x <= 1; ++x) {\n                vec3 c = ip + vec3(float(x), float(y), float(z));\n                vec3 s = c + sfxHash33(c);\n                vec3 d = s - p;\n                float dd = dot(d, d);\n                if (dd < b1) { b2 = b1; b1 = dd; best = s; }\n                else if (dd < b2) { b2 = dd; }\n            }\n        }\n    }\n    site  = best;\n    dist  = sqrt(b1);\n    dist2 = sqrt(b2);\n}\n\n// ----------------------------------------------------------------- rotation ---\n\nvec4 sfxQuatAxis(vec3 axis, float angle) {\n    float h = angle * 0.5;\n    return vec4(normalize(axis) * sin(h), cos(h));\n}\n\nvec3 sfxRotAxis(vec3 v, vec3 axis, float angle) {\n    vec3 k = normalize(axis);\n    float c = cos(angle), s = sin(angle);\n    return v * c + cross(k, v) * s + k * dot(k, v) * (1.0 - c);\n}\n\n// Normalised lerp between two quaternions, shortest arc. Not a slerp: the\n// angular rate is uneven, which nobody can see on a covariance frame, and the\n// only property the point/gaussian crossfade needs is continuity in t.\nvec4 sfxQuatNlerp(vec4 a, vec4 b, float t) {\n    b *= (dot(a, b) < 0.0 ? -1.0 : 1.0);\n    return normalize(mix(a, b, t) + vec4(0.0, 0.0, 0.0, 1e-9));\n}\n\n// Any unit vector orthogonal to n.\nvec3 sfxOrtho(vec3 n) {\n    vec3 up = mix(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), step(0.9, abs(n.y)));\n    return normalize(cross(n, up));\n}\n\n// ------------------------------------------------------------------- easing ---\n\nfloat sfxSmooth(float t) {\n    t = clamp(t, 0.0, 1.0);\n    return t * t * (3.0 - 2.0 * t);\n}\n\nfloat sfxSinc(float x) {\n    return abs(x) < 1e-4 ? 1.0 - x * x / 6.0 : sin(x) / x;\n}\n\n// Per-splat staggered sub-progress: splats with a higher 'order' (0..1) start\n// later, so any effect can be turned into a sweep.\nfloat sfxStagger(float prog, float order, float spread) {\n    float s = clamp(spread, 0.0, 0.95);\n    return clamp((prog * (1.0 + s) - order * s) / max(1.0 - s, 1e-3), 0.0, 1.0);\n}\n\n// Real spherical harmonics, l = 2..4, on a unit direction. uFreq slides the\n// weight from the smooth low band up into the high band.\nfloat sfxSH(vec3 n) {\n    float x = n.x, y = n.y, z = n.z;\n    float Y20 = 0.5 * (3.0 * z * z - 1.0);\n    float Y22 = 0.8660254 * (x * x - y * y);\n    float Y31 = 0.5 * x * (5.0 * z * z - 1.0);\n    float Y33 = 0.7905694 * x * (x * x - 3.0 * y * y);\n    float Y44 = 0.625 * (x * x * (x * x - 3.0 * y * y) - y * y * (3.0 * x * x - y * y));\n    float w = clamp(uFreq * 0.25, 0.0, 1.0);\n    float low  = 0.75 * Y20 + 0.55 * Y22;\n    float high = 0.60 * Y31 + 0.80 * Y33 + 0.90 * Y44;\n    return mix(low, high, w);\n}\n\n// ------------------------------------------------------ point/gaussian mix ---\n\n// How much of the point-cloud representation is showing: 1 = uniform spheres,\n// 0 = the capture's own gaussians. Depends only on uniforms, so the geometry\n// pass and the colour pass can each ask for it without passing state.\n//\n// uPointBlend is the progress at which the cloud is fully points. At 0 the\n// blend is off and point mode is absolute at every progress, which is the\n// original behaviour. Above 0 the assembled end resolves back into real 3DGS,\n// so an In transition lands on the capture itself and the dots only exist\n// while the effect is actually dispersing.\nfloat sfxPointMix() {\n    if (uPointSize <= 0.0) return 0.0;\n    if (uPointBlend <= 0.0) return 1.0;\n    return sfxSmooth(uProg / uPointBlend);\n}\n\n\n// ============================================================ 0. MCMC ======\n\n// Random-walk Metropolis-Hastings. Each splat is an independent chain sampling\n// pi(x) ~ exp(-U(x)); U is a spherical-shell well carved by fbm ridges, so the\n// bonsai anneals into the target distribution as the chain length grows.\n//\n// Chain length = uProg * MCMC_STEPS, with the final step blended fractionally\n// so the walk is continuous in uProg. The chain is seeded from the splat's own\n// position, which makes it deterministic (and therefore flicker-free) without\n// any ping-pong buffer.\n\n#define MCMC_STEPS 24\n\n// Per-chain shell radius, so the target distribution keeps the cloud's original\n// radial thickness instead of crushing 165k splats onto one thin sphere.\nfloat gShellR = 0.8;\n\nfloat sfxPotential(vec3 x) {\n    vec3 d = (x - uPivot) / uExtent;\n    float r = length(d);\n    float well   = 9.0 * (r - gShellR) * (r - gShellR);\n    float ridges = -4.0 * uTurb * sfxFbm(d * max(uFreq, 0.1) * 1.6 + uTime * 0.05);\n    return well + ridges;\n}\n\nvec3 sfxMcmc(vec3 x0) {\n    uint s = gSeed;\n    float r0 = length(x0 - uPivot) / uExtent;\n    gShellR = mix(0.35, 1.0, clamp(r0, 0.0, 1.0));\n\n    vec3  x = x0;\n    float U = sfxPotential(x);\n    float sigma = uAmp * uExtent * 0.10;\n    float steps = uProg * float(MCMC_STEPS);\n    float accepted = 0.0;\n    float taken = 0.0;\n\n    for (int i = 0; i < MCMC_STEPS; ++i) {\n        float w = clamp(steps - float(i), 0.0, 1.0);\n        if (w <= 0.0) break;\n        taken += w;\n\n        vec3  prop = x + sigma * sfxGauss3(s);               // symmetric proposal\n        float Up   = sfxPotential(prop);\n        float a    = exp(min(0.0, U - Up));                  // min(1, pi'/pi)\n\n        if (sfxRnd(s) < a) {\n            x = mix(x, prop, w);\n            U = sfxPotential(x);\n            accepted += w;\n        }\n    }\n\n    float rate = clamp(accepted / max(taken, 1e-3), 0.0, 1.0);\n    gDisp = rate * sfxSmooth(uProg * 1.6);\n    // only chains that actually travelled flare, so the glow stays sparse\n    gEdge = clamp(length(x - x0) / (uExtent * 0.45), 0.0, 1.0) * (1.0 - uProg * 0.6);\n    gInflate = 1.0 + uProg * uSizeGain * 0.5;\n    return x;\n}\n\n\n// ======================================================= 1. DIFFUSION ======\n\n// The DDPM forward process with the cosine noise schedule:\n//     x_t = sqrt(a_bar) * x_0 + sqrt(1 - a_bar) * eps,   eps ~ N(0, I)\n// run in pivot-centred coordinates. The covariance is inflated by the same\n// (1 - a_bar) factor, so the gaussians physically blur out as the signal-to-\n// noise ratio collapses. Reversing uProg is the denoising direction.\n\nvec3 sfxDiffusion(vec3 p) {\n    const float s = 0.008;\n    float f = cos((uProg + s) / (1.0 + s) * (SFX_PI * 0.5));\n    float abar = clamp(f * f, 0.0, 1.0);\n    float sa = sqrt(abar);\n    float sb = sqrt(1.0 - abar);\n\n    uint sd = gSeed;\n    vec3 eps = sfxGauss3(sd);\n    // slow rotary drift so the noise ball is never completely static\n    eps = sfxRotAxis(eps, normalize(vec3(0.3, 1.0, 0.2)), uTime * uSpin * 0.35);\n\n    vec3 x0 = p - uPivot;\n    vec3 xt = sa * x0 + sb * eps * uExtent * uAmp * 0.45;\n\n    gDisp    = sb;\n    gEdge    = sb * (1.0 - sb) * 3.2;\n    gInflate = 1.0 + sb * sb * uSizeGain * 3.5;\n    gStretch = 0.0;\n    return uPivot + xt;\n}\n\n\n// ============================================================ 2. CURL ======\n\n// Advection along v = curl(psi). Divergence-free, so the cloud shears and\n// folds like smoke instead of simply inflating. Midpoint (RK2) integration of\n// a single large time step, plus a buoyancy term along +Y.\n\nvec3 sfxCurlFlow(vec3 p) {\n    float scale = max(uFreq, 0.05) * 1.1 / uExtent;\n    vec3  q = p * scale + vec3(0.0, -uTime * uSpin * 0.15, 0.0);\n    float eps = 0.35;\n\n    vec3 v1 = sfxCurl(q, eps);\n    vec3 v2 = sfxCurl(q + v1 * 0.35, eps);\n\n    float k  = uProg;\n    float dt = k * uAmp * uExtent * 0.65;\n    vec3  x  = p + v2 * dt;\n    x.y += k * k * uExtent * uTurb * 0.9;                    // buoyancy\n\n    gDisp    = k;\n    gVel     = normalize(v2 + vec3(1e-5));\n    gStretch = k * uSizeGain * 0.9;\n    gEdge    = clamp(length(v2) * 0.5, 0.0, 1.0) * k * (1.0 - k) * 3.0;\n    return x;\n}\n\n\n// =============================================== 3. HARMONIC MANIFOLD ======\n\n// Every splat is projected onto the radial surface r(n) = R * (1 + a * Y(n)),\n// where Y is a real spherical-harmonic combination of bands 2..4 (uFreq slides\n// the weight from the low band to the high band). The lobed shell rotates, so\n// the cloud reads as a slowly tumbling harmonic manifold.\n\nvec3 sfxHarmonic(vec3 p) {\n    vec3  d = p - uPivot;\n    float r = length(d) + 1e-6;\n    vec3  n = d / r;\n\n    vec3 nr = sfxRotAxis(n, normalize(vec3(0.2, 1.0, 0.35)), uTime * uSpin * 0.5);\n    float y = sfxSH(nr);\n\n    // The SH sum has no fixed range — it is whatever the band weights happen to\n    // add up to — so it is normalised to -1..1 first.\n    float lobe = clamp(y * 1.2, -1.0, 1.0);\n\n    // Sized against the capture's width rather than its bounding radius: the\n    // shell's mean radius is exactly the model's width, so it spans 2x that\n    // across, whatever model is loaded. The lobes swing symmetrically about\n    // that mean rather than carving into it — carve one way only and the mean\n    // collapses with lobe depth, so the width no longer stays put.\n    float R = uWidth * (1.0 + clamp(uAmp, 0.0, 1.5) * 0.45 * lobe);\n\n    // Keep the shell's thickness proportional to the original radial spread.\n    // Inward only — a splat further out than uExtent would otherwise push the\n    // envelope past the width above.\n    R *= mix(1.0, clamp(r / uExtent, 0.0, 1.0), clamp(uTurb, 0.0, 1.0) * 0.55);\n\n    float k = sfxStagger(uProg, sfxSmooth(clamp(r / (uExtent * 1.2), 0.0, 1.0)), 0.45);\n    k = sfxSmooth(k);\n\n    gDisp    = k;\n    gEdge    = clamp(abs(y) * 1.2, 0.0, 1.0) * k;\n    gInflate = 1.0 + k * uSizeGain * 1.2;\n    return mix(p, uPivot + n * R, k);\n}\n\n\n// ============================================================ 4. VORTEX ======\n\n// Logarithmic-spiral infall around the +Y axis. The radius decays as\n// r' = r * exp(-b*k) while the swept angle follows a Keplerian-style\n// 1/r^1.5 law, so inner splats whip around far faster than outer ones. The\n// disc also flattens along the axis. Each gaussian is stretched along its own\n// instantaneous velocity, which produces real motion-blur streaks.\n\nvec3 sfxVortex(vec3 p) {\n    vec3 ax = vec3(0.0, 1.0, 0.0);\n    vec3 d = p - uPivot;\n    float h = dot(d, ax);\n    vec3 rad = d - ax * h;\n    float r = length(rad) + 1e-5;\n    vec3 er = rad / r;\n    vec3 et = cross(ax, er);\n\n    float k  = uProg;\n    float rn = r * exp(-uAmp * 1.8 * k);\n    float dtheta = k * uSpin * 3.0 * pow(uExtent / (r + 0.22 * uExtent), 1.5);\n    float hn = h * exp(-2.6 * uTurb * k);\n\n    vec3 pos = uPivot + ax * hn + (er * cos(dtheta) + et * sin(dtheta)) * rn;\n\n    // velocity = tangential sweep + radial infall, for the streak direction\n    vec3 vel = et * (rn * dtheta) + er * (rn - r) - ax * (h - hn);\n    float vlen = length(vel);\n\n    gDisp    = k;\n    gVel     = vel / max(vlen, 1e-5);\n    gStretch = uSizeGain * clamp(vlen / (uExtent * 0.55), 0.0, 2.5);\n    gEdge    = clamp(dtheta * 0.18, 0.0, 1.0) * k;\n    return pos;\n}\n\n\n// ========================================================= 5. SHOCKWAVE ======\n\n// Solution-shaped radial wave packet: a sinc carrier under a gaussian envelope,\n//     d(r) = A * sinc(k(r - R)) * exp(-((r - R)/w)^2),  R = front radius,\n// with a permanent outward push behind the front so the wave actually clears\n// the geometry. Splats sitting on the front flare and swell.\n\nvec3 sfxShockwave(vec3 p) {\n    vec3  d = p - uPivot;\n    float r = length(d) + 1e-6;\n    vec3  er = d / r;\n\n    float rn    = r / uExtent;\n    float front = uProg * 1.9;\n    float w     = max(uTurb, 0.04) * 0.55;\n\n    float phase = (rn - front) * max(uFreq, 0.1) * 7.0;\n    float env   = exp(-pow((rn - front) / w, 2.0));\n    float wave  = sfxSinc(phase) * env;\n\n    float behind = 1.0 - smoothstep(-0.30, 0.02, rn - front);\n    float disp = uAmp * uExtent * 0.45 * wave\n               + behind * uProg * uExtent * uAmp * 0.7;\n\n    gDisp    = behind * sfxSmooth(uProg);\n    gEdge    = clamp(env, 0.0, 1.0);\n    gInflate = 1.0 + env * uSizeGain * 2.2;\n    gVel     = er;\n    gStretch = env * uSizeGain * 1.1;\n    return p + er * disp;\n}\n\n\n// =========================================================== 6. SHATTER ======\n\n// Worley cells partition the cloud into rigid shards. Every shard gets one\n// linear velocity (radial, jittered), one angular velocity about a random axis,\n// and gravity. The shard's rotation is composed onto each splat's own\n// quaternion, so the gaussians rotate *with* the shard rather than sliding\n// through it - the fragments stay solid.\n\nvec3 sfxShatter(vec3 p) {\n    float cell = uExtent / max(uFreq * 0.9, 0.3);\n    vec3 site; float d1, d2;\n    sfxWorley(p / cell, site, d1, d2);\n    vec3 sw = site * cell;\n\n    uint cs = sfxSeedPos(site);\n    vec3 out1 = normalize(sw - uPivot + vec3(1e-4));\n    vec3 jit  = normalize(sfxGauss3(cs) + vec3(1e-4));\n    vec3 v    = normalize(mix(out1, jit, 0.4)) * (0.55 + 0.9 * sfxRnd(cs));\n\n    float k = uProg;\n    float ke = sfxSmooth(k) * k;                             // ease-in launch\n    vec3 disp = v * ke * uExtent * uAmp * 1.1;\n    disp.y -= uTurb * 1.8 * uExtent * k * k;                 // gravity\n\n    vec3 raxis = normalize(sfxGauss3(cs) + vec3(1e-4));\n    float ang  = ke * uSpin * 5.0 * (sfxRnd(cs) * 2.0 - 1.0);\n    gSpinQ = sfxQuatAxis(raxis, ang);\n\n    vec3 local = p - sw;\n    gDisp = k;\n    // the seam between cells lights up as the shards separate\n    gEdge = clamp(1.0 - (d2 - d1) * 3.0, 0.0, 1.0) * k * (1.0 - k) * 3.2;\n    return sw + sfxRotAxis(local, raxis, ang) + disp;\n}\n\n\n// ====================================================== 7. PHYLLOTAXIS ======\n\n// Order out of chaos: splats are re-indexed onto a Fermat spiral using the\n// golden angle (137.508 deg), r = c*sqrt(t), lifted along Y into a helicoid.\n// Because consecutive indices land on opposite sides of the disc, the cloud\n// unwinds rather than collapsing.\n\nvec3 sfxPhyllotaxis(vec3 p) {\n    float i = float(splat.index);\n    float t = (i + 0.5) / max(uSplatCount, 1.0);\n\n    float th = i * SFX_GOLDEN * max(uFreq * 0.35, 0.02) + uTime * uSpin * 0.4;\n    float r  = sqrt(t) * uExtent * 0.95 * uAmp;\n    float h  = (t - 0.5) * uExtent * 1.3 * uTurb;\n\n    vec3 ax = vec3(0.0, 1.0, 0.0);\n    vec3 e1 = sfxOrtho(ax);\n    vec3 e2 = cross(ax, e1);\n    vec3 target = uPivot + ax * h + (e1 * cos(th) + e2 * sin(th)) * r;\n\n    float k = sfxSmooth(sfxStagger(uProg, t, 0.5));\n\n    gDisp    = k;\n    gEdge    = k * (1.0 - k) * 3.4;\n    gInflate = 1.0 + k * uSizeGain * 0.8;\n    gVel     = normalize(target - p + vec3(1e-5));\n    gStretch = k * (1.0 - k) * uSizeGain * 1.4;\n    return mix(p, target, k);\n}\n\n\n// ============================================================= 8. WIPE ======\n\n// Stratified dissolve. Each splat's threshold mixes a directional term with the\n// R2 low-discrepancy sequence (Roberts' generalisation of the golden ratio),\n// t_i = frac(0.5 + i/phi_2). R2 is far more uniform than white noise, so the\n// dissolve front stays visually even instead of clumping. Splats shrink to\n// nothing through the front, flaring as they go.\n\nvec3 sfxWipe(vec3 p) {\n    // R2 sequence, in fixed point: the float form fract(0.5 + i/g) loses its\n    // fractional bits at these indices and bands into ~256 discrete waves.\n    uint i = splat.index + 1u;\n    float r2  = sfxWeyl(i, SFX_W_R2A);\n    float r2b = sfxWeyl(i, SFX_W_R2B);\n\n    vec3 n = normalize(vec3(0.25, 1.0, 0.1));\n    float s = clamp(dot(p - uPivot, n) / (uExtent * 2.0) + 0.5, 0.0, 1.0);\n    float thr = mix(s, r2, clamp(uTurb, 0.0, 1.0));\n\n    float band = uFreq * 0.22 + 0.04;\n    float k = clamp((uProg * (1.0 + band) - thr) / band, 0.0, 1.0);\n\n    gHide = k;\n    gEdge = 1.0 - abs(k * 2.0 - 1.0);\n    gDisp = k;\n    gInflate = 1.0 + gEdge * uSizeGain * 2.2;\n\n    vec3 dir = normalize(p - uPivot + vec3(1e-5));\n    return p + dir * k * k * uExtent * uAmp * 0.35\n             + n * k * uExtent * uAmp * 0.25 * (r2b - 0.5);\n}\n\n\n// ============================================================= 9. MELT ======\n\n// Pure 3D-gaussian-splatting math: read this splat's own covariance, find its\n// dominant principal axis, then drive the anisotropy to an extreme - the long\n// axis grows, the two short axes collapse. Every gaussian becomes a needle\n// aligned with its own eigenvector and slides along it. The scale surgery\n// itself happens in modifySplatRotationScale via gMelt.\n\nvec3 sfxMelt(vec3 p) {\n    vec4 wq = quatMul(model_rotation, getRotation().yzwx);\n    vec3 sc  = model_scale * getScale();\n    mat3 R   = quatToMat3(wq);\n\n    vec3 axis = R[0];\n    float m = sc.x;\n    if (sc.y > m) { axis = R[1]; m = sc.y; }\n    if (sc.z > m) { axis = R[2]; m = sc.z; }\n    axis = normalize(axis);\n\n    uint s = gSeed;\n    float sgn = sfxRnd(s) < 0.5 ? -1.0 : 1.0;\n    float k = uProg;\n    vec3 tur = vec3(sfxFbm(p * max(uFreq, 0.1) * 2.0 / uExtent),\n                    sfxFbm(p * max(uFreq, 0.1) * 2.0 / uExtent + 19.7),\n                    sfxFbm(p * max(uFreq, 0.1) * 2.0 / uExtent - 7.3));\n\n    gMelt    = true;\n    gDisp    = k;\n    gVel     = axis * sgn;\n    gStretch = 0.0;                 // gMelt path handles the stretch\n    gEdge    = k * (1.0 - k) * 3.0;\n\n    return p + axis * sgn * k * uExtent * uAmp * 0.55 * (0.35 + 0.65 * sfxRnd(s))\n             + tur * k * k * uExtent * uTurb * 0.6;\n}\n\n\n// 10. WIND BLOW\n//\n// A particle starting at rest in a wind field w under linear (Stokes) drag obeys\n//     dv/dt = k(w - v)   ->   v(t) = w(1 - e^-kt)\n//                             x(t) = x0 + w(t + (e^-kt - 1)/k)\n// so the whole trajectory is analytic - no integration loop needed. Each point\n// draws its own drag coefficient, so light debris leaves immediately and heavy\n// debris lags behind; that spread is what reads as wind rather than as a rigid\n// translation of the whole cloud.\n\nvec3 sfxWindField(vec3 p, float t) {\n    // steady direction that veers slowly, times a gust travelling downwind\n    float veer = sin(t * 0.35) * 0.4 * uSpin;\n    vec3 dir = normalize(vec3(cos(veer), 0.24, sin(veer) * 0.55));\n    float gust = 1.0 + 0.6 * sin(dot(p - uPivot, dir) * max(uFreq, 0.05) * 3.0 / uExtent\n                                 - t * 2.2);\n    return dir * gust;\n}\n\nvec3 sfxWind(vec3 p) {\n    uint s = gSeed;\n\n    float mass = 0.35 + 1.65 * sfxRnd(s);           // heavier debris drags less\n    float kDrag = 3.0 / mass;\n    float release = sfxRnd(s) * 0.3;                // staggered detachment\n    float t = max(uProg - release, 0.0) / max(1.0 - release, 1e-3) * 1.2;\n\n    vec3 w = sfxWindField(p, uTime) * max(uAmp, 0.0) * uExtent * 1.1;\n    vec3 disp = w * (t + (exp(-kDrag * t) - 1.0) / kDrag);\n\n    // cross-wind turbulence, so the stream frays as it goes\n    vec3 q = p * 2.2 / uExtent + vec3(0.0, 0.0, uTime * 0.5);\n    vec3 tur = vec3(sfxFbm(q), sfxFbm(q + 13.1), sfxFbm(q - 5.7));\n    disp += tur * uTurb * uExtent * t * 0.8;\n\n    vec3 vel = w * (1.0 - exp(-kDrag * t));\n    float sp = length(vel);\n\n    gDisp = clamp(t, 0.0, 1.0);\n    gVel = vel / max(sp, 1e-5);\n    gStretch = uSizeGain * clamp(sp / (uExtent * 1.2), 0.0, 2.5);\n    gEdge = clamp(t * (1.0 - t) * 3.2, 0.0, 1.0);\n    return p + disp;\n}\n\n\n// 11. CHLADNI NODAL SET\n//\n// A 3D standing wave, the volumetric cousin of the sand figures on a vibrating\n// Chladni plate:\n//     f(x) = sin(a x) sin(b y) sin(c z) + sin(b x) sin(c y) sin(a z)\n// Sand collects where the plate does not move, i.e. on f = 0. Each splat is\n// pushed onto that nodal surface by Newton iteration on the level set,\n//     x <- x - f * grad(f) / |grad(f)|^2\n// using the analytic gradient. Six steps is plenty. Mode numbers come from the\n// band slider, and the whole wave frame rotates.\n\n#define CHLADNI_STEPS 6\n\nfloat sfxChladniF(vec3 q, vec3 m, out vec3 grad) {\n    float a = m.x, b = m.y, c = m.z;\n    float sax = sin(a * q.x), cax = cos(a * q.x);\n    float sbx = sin(b * q.x), cbx = cos(b * q.x);\n    float sby = sin(b * q.y), cby = cos(b * q.y);\n    float scy = sin(c * q.y), ccy = cos(c * q.y);\n    float scz = sin(c * q.z), ccz = cos(c * q.z);\n    float saz = sin(a * q.z), caz = cos(a * q.z);\n\n    grad = vec3(a * cax * sby * scz + b * cbx * scy * saz,\n                b * sax * cby * scz + c * sbx * ccy * saz,\n                c * sax * sby * ccz + a * sbx * scy * caz);\n    return sax * sby * scz + sbx * scy * saz;\n}\n\nvec3 sfxChladni(vec3 p) {\n    float n = 1.0 + floor(max(uFreq, 0.0) * 1.5);\n    vec3 m = vec3(n, n + 1.0, n + 2.0) * (SFX_PI / uExtent) * 2.2;\n    float maxStep = SFX_TAU / m.x * 0.3;    // ~a third of a wavelength\n\n    vec3 ax = normalize(vec3(0.3, 1.0, 0.15));\n    float ang = uTime * uSpin * 0.16;\n\n    vec3 q = p - uPivot;\n    vec3 t = sfxRotAxis(q, ax, -ang);       // into the wave's frame\n\n    float f0 = 0.0;\n    for (int i = 0; i < CHLADNI_STEPS; ++i) {\n        vec3 g;\n        float f = sfxChladniF(t, m, g);\n        if (i == 0) f0 = f;\n        vec3 dq = g * (f / (dot(g, g) + 1e-4));\n        float l = length(dq);\n        t -= dq * min(1.0, maxStep / max(l, 1e-6));\n    }\n\n    t = sfxRotAxis(t, ax, ang);             // back to world\n    // spread the sheet slightly so it reads as a shell, not a zero-thickness film\n    if (uTurb > 0.0) {\n        uint s = gSeed;\n        t += normalize(sfxGauss3(s) + vec3(1e-4)) * uExtent * 0.05 * uTurb;\n    }\n\n    float k = sfxSmooth(sfxStagger(uProg, sfxWeyl(splat.index, SFX_W_PHI), 0.35));\n    gDisp = k;\n    gEdge = clamp(1.0 - abs(f0) * 1.5, 0.0, 1.0) * k;   // already-nodal points glow\n    return uPivot + mix(q, t * max(uAmp, 0.05), k);\n}\n\n\n// 12. N-BODY SWARM\n//\n// Softened-gravity leapfrog integration against a handful of orbiting\n// attractors:\n//     a(x) = sum_j GM (s_j - x) / (|s_j - x|^2 + e^2)^(3/2)\n// The e^2 softening term is what keeps a close pass from producing an infinite\n// impulse - standard practice in real N-body codes. Every splat is launched\n// with a tangential kick, so the cloud settles into orbits and braided streams\n// instead of collapsing straight to the centres.\n\n#define NBODY_STEPS 22\n#define NBODY_COUNT 4\n\nvec3 sfxAttractorPos(int i, float t) {\n    float a = float(i) * (SFX_TAU / float(NBODY_COUNT)) + t;\n    return uPivot + uExtent * 0.8 * vec3(cos(a),\n                                         0.4 * sin(a * 2.0 + float(i)),\n                                         sin(a));\n}\n\nvec3 sfxNBody(vec3 p) {\n    float t = uTime * uSpin * 0.22;\n    float gm = max(uAmp, 0.0) * uExtent * uExtent * 0.65;\n    float soft2 = uExtent * uExtent * 0.05;\n\n    vec3 att[NBODY_COUNT];\n    for (int j = 0; j < NBODY_COUNT; ++j) att[j] = sfxAttractorPos(j, t);\n\n    uint s = gSeed;\n    vec3 r0 = p - uPivot;\n    vec3 v = cross(vec3(0.0, 1.0, 0.0), r0) * (0.55 + 0.45 * sfxRnd(s))\n           + normalize(sfxGauss3(s) + vec3(1e-4)) * uExtent * 0.3 * uTurb;\n\n    float dt = uProg * 1.25 / float(NBODY_STEPS);\n    vec3 x = p;\n    for (int i = 0; i < NBODY_STEPS; ++i) {\n        vec3 a = vec3(0.0);\n        for (int j = 0; j < NBODY_COUNT; ++j) {\n            vec3 d = att[j] - x;\n            float d2 = dot(d, d) + soft2;\n            a += d * (gm / (d2 * sqrt(d2)));\n        }\n        v += a * dt;            // kick\n        x += v * dt;            // drift\n    }\n\n    // leash: a close pass can still slingshot a point, and it must not escape\n    // the inflated bounds\n    vec3 o = x - uPivot;\n    o *= min(1.0, uExtent * 2.4 / max(length(o), 1e-5));\n\n    float sp = length(v);\n    gDisp = uProg;\n    gVel = v / max(sp, 1e-5);\n    gStretch = uSizeGain * clamp(sp / (uExtent * 3.0), 0.0, 2.0);\n    gEdge = clamp(sp / (uExtent * 4.0), 0.0, 1.0) * uProg;\n    return uPivot + o;\n}\n\n\n// 13. LATTICE QUANTIZE\n//\n// Snaps every splat to the nearest site of a body-centred cubic lattice: the\n// simple cubic grid plus its half-offset interleave, whichever site is closer.\n// BCC fills space more evenly than a plain cubic grid (packing 0.68 vs 0.52),\n// so the quantised cloud looks regular instead of striped. The lattice frame\n// tumbles, so it is never axis-aligned with the capture.\n//\n// Because many splats collapse onto exactly the same site, this is the effect\n// that most wants point rendering - it turns the capture into voxel dust.\n\nvec3 sfxLattice(vec3 p) {\n    float a = uExtent / max(uFreq * 4.0, 0.4);      // lattice constant\n    vec3 ax = normalize(vec3(0.35, 1.0, 0.2));\n    float ang = uTime * uSpin * 0.12;\n\n    vec3 q = sfxRotAxis(p - uPivot, ax, -ang) / a;\n\n    vec3 c1 = floor(q + 0.5);                       // simple cubic site\n    vec3 c2 = floor(q) + 0.5;                       // body-centred site\n    float pick = step(dot(q - c1, q - c1), dot(q - c2, q - c2));\n    vec3 site = mix(c2, c1, pick);\n\n    vec3 target = uPivot + sfxRotAxis(site * a * max(uAmp, 0.05), ax, ang);\n\n    uint s = gSeed;\n    float order = sfxRnd(s);\n    float k = sfxSmooth(sfxStagger(uProg, order, clamp(uTurb, 0.0, 0.9)));\n\n    gDisp = k;\n    // the moment of snapping is what should flash, not the settled state\n    gEdge = k * (1.0 - k) * 3.6;\n    return mix(p, target, k);\n}\n\n\n// 14. DOUBLE HELIX\n//\n// Splats are re-indexed onto a parametric double helix: two backbones a half\n// turn apart,\n//     x(t) = C + axis*(t - 1/2)*H + (e1 cos(w t + s pi) + e2 sin(w t + s pi)) * R\n// with a fraction of the points placed on the chord between the strands at the\n// same t, forming base-pair rungs. The rungs are what make it read as a helix\n// rather than two unrelated spirals, and they only work as discrete points -\n// as stretched gaussians they smear into a tube.\n\nvec3 sfxHelix(vec3 p) {\n    float t = (float(splat.index) + 0.5) / max(uSplatCount, 1.0);\n\n    uint s = gSeed;\n    float strand = step(0.5, sfxRnd(s));      // which backbone\n    float rungPick = sfxRnd(s);\n    float chord = sfxRnd(s);                  // position across a base pair\n\n    float turns = max(uFreq, 0.15) * 4.0;\n    float amp = max(uAmp, 0.05);\n    float rad = uExtent * 0.4 * amp;\n    float phase = uTime * uSpin * 0.3;\n\n    vec3 ax = vec3(0.0, 1.0, 0.0);\n    vec3 e1 = sfxOrtho(ax);\n    vec3 e2 = cross(ax, e1);\n\n    // backbone: the point's own parameter, offset half a turn by strand\n    float th = t * turns * SFX_TAU + phase + strand * SFX_PI;\n    vec3 backbone = uPivot + ax * ((t - 0.5) * uExtent * 1.9 * amp)\n                  + (e1 * cos(th) + e2 * sin(th)) * rad;\n\n    // base pairs: quantise the parameter so rungs land at discrete rows rather\n    // than smearing into a continuous sheet, then run across the axis\n    float rows = turns * 9.0;\n    float tq = (floor(t * rows) + 0.5) / rows;\n    float thq = tq * turns * SFX_TAU + phase;\n    vec3 dirq = e1 * cos(thq) + e2 * sin(thq);\n    vec3 rung = uPivot + ax * ((tq - 0.5) * uExtent * 1.9 * amp)\n              + dirq * rad * (1.0 - 2.0 * chord);\n\n    float isRung = step(1.0 - clamp(uTurb, 0.0, 0.8), rungPick);\n    vec3 target = mix(backbone, rung, isRung);\n    // scatter each point slightly off the ideal curve, so the strand is a tube\n    // of beads instead of a zero-thickness ribbon\n    target += normalize(sfxGauss3(s) + vec3(1e-4)) * uExtent * 0.012;\n\n    float k = sfxSmooth(sfxStagger(uProg, t, 0.4));\n\n    // A 1D curve cannot absorb 165k points and stay legible: at full population\n    // the projected coverage is several times the strand area, so it renders as\n    // a solid tube. Only a subset joins the strands; the rest dissolve away.\n    float keep = step(sfxRnd(s), clamp(uSizeGain, 0.02, 1.0));\n\n    gDisp = k;\n    gHide = (1.0 - keep) * k;\n    gEdge = k * (1.0 - k) * 3.0 * (1.0 - isRung * 0.5);\n    return mix(p, target, k);\n}\n\n\n// 15. BEAM UP\n//\n// Transporter dematerialisation. A release front sweeps up through the cloud;\n// once a point is released it accelerates upward while spiralling in toward the\n// beam axis, and a high-frequency shimmer modulates its brightness and size.\n// Released points fade out at the top, so the frame clears from the bottom up.\n//\n// The rise is quadratic in the release amount rather than linear, which reads as\n// acceleration - a linear lift looks like a rigid escalator.\n\nvec3 sfxBeamUp(vec3 p) {\n    vec3 d = p - uPivot;\n\n    // 0 at the bottom of the cloud, 1 at the top\n    float y0 = clamp(d.y / (uExtent * 1.4) + 0.5, 0.0, 1.0);\n\n    // a soft front sweeps upward; band width sets how much is in flight at once\n    float band = 0.16 + 0.55 * clamp(uTurb, 0.0, 1.0);\n    float front = uProg * (1.0 + band);\n    float r = clamp((front - y0) / band, 0.0, 1.0);\n    float re = r * r;                                    // accelerating lift\n\n    float lift = re * uExtent * 1.8 * max(uAmp, 0.05);\n\n    // converge toward the beam axis while spiralling around it\n    vec3 rad = vec3(d.x, 0.0, d.z);\n    // only a partial squeeze: converging hard piles every released point into a\n    // narrow column, which overdraws into a solid white bar\n    vec3 radr = sfxRotAxis(rad, vec3(0.0, 1.0, 0.0), re * uSpin * 3.0)\n              * (1.0 - r * 0.4);\n\n    // shimmer: fine noise scrolling upward much faster than the front\n    float sh = sfxNoise(p * max(uFreq, 0.1) * 20.0 / uExtent\n                        + vec3(0.0, uTime * 9.0, 0.0));\n    float sparkle = clamp(sh * 0.5 + 0.5, 0.0, 1.0);\n\n    gDisp    = r;\n    gVel     = vec3(0.0, 1.0, 0.0);\n    gStretch = r * (1.0 - r) * uSizeGain * 3.0;           // vertical beam streaks\n    gInflate = 1.0 + sparkle * r * uSizeGain * 1.5;\n    gEdge    = r * (1.0 - r) * 2.6 + sparkle * r * 0.8;\n    gHide    = smoothstep(0.72, 1.0, r);\n\n    return uPivot + radr + vec3(0.0, d.y + lift, 0.0);\n}\n\n\n// 16. FIBONACCI SPHERE\n//\n// The right way to put N points evenly on a sphere is a spherical Fibonacci\n// lattice: walk z down in equal steps and advance the azimuth by the golden\n// ratio each time,\n//     z_i = 1 - 2(i + 1/2)/N,   theta_i = 2 pi frac(i / phi)\n// which is the 2D analogue of the golden-angle spiral. No pole clustering, and\n// no need to solve for a spiral that closes.\n//\n// Two details worth the trouble:\n//  - the azimuth uses the fixed-point Weyl sequence, because fract(i / phi)\n//    loses its fractional bits in float32 at these indices;\n//  - filling the interior uniformly needs the *cube root* of a uniform variate,\n//    since volume grows as r^3. A plain uniform radius crowds everything into\n//    the middle - the classic sphere-sampling trap.\n\nvec3 sfxFibSphere(vec3 p) {\n    float i = float(splat.index);\n    float N = max(uSplatCount, 1.0);\n\n    // interleave across concentric shells so every shell gets an even share\n    float shells = max(floor(max(uFreq, 1.0)), 1.0);\n    float shell = mod(i, shells);\n    float k = floor(i / shells);\n    float M = max(ceil(N / shells), 1.0);\n\n    float z = 1.0 - 2.0 * (k + 0.5) / M;\n    float rr = sqrt(max(0.0, 1.0 - z * z));\n    float th = SFX_TAU * sfxWeyl(uint(k), SFX_W_PHI);\n    vec3 dir = vec3(rr * cos(th), z, rr * sin(th));\n\n    dir = sfxRotAxis(dir, normalize(vec3(0.25, 1.0, 0.1)), uTime * uSpin * 0.25);\n\n    // Radius is measured against the capture's width rather than its bounding\n    // radius: at a Radius of 1 the outermost shell sits at exactly 3x the\n    // model's width, whatever model is loaded.\n    float R = uWidth * 3.0 * max(uAmp, 0.05) * (shell + 1.0) / shells;\n    uint s = gSeed;\n    R *= mix(1.0, pow(max(sfxRnd(s), 1e-4), 1.0 / 3.0), clamp(uTurb, 0.0, 1.0));\n\n    float kk = sfxSmooth(sfxStagger(uProg, k / M, 0.35));\n    gDisp = kk;\n    gEdge = kk * (1.0 - kk) * 3.0;\n    return mix(p, uPivot + dir * R, kk);\n}\n\n\n// 17. TORNADO\n//\n// A Rankine vortex fed by an updraft. Outside the core radius the flow is a\n// free vortex: angular momentum L = v_theta * r is conserved, so\n//     omega(r) = L / r^2\n// and material spins up as it is drawn in - which is the whole reason a tornado\n// tightens into a scream instead of turning at one lazy rate. Inside the core\n// the vortex rotates as a solid body, which caps the rate on the axis and is\n// what stops the middle from shearing itself apart.\n//\n// The swept angle needs no integration loop. Along the converging path\n// r(k) = mix(r0, r1, k) the integral is closed form,\n//     integral_0^k dk' / r(k')^2  =  k / (r0 * r(k))\n// so the entire spiral is one expression, and scrubbing the timeline backwards\n// retraces it exactly.\n//\n// Three motions run at once: that sweep, a radial collapse onto the funnel\n// wall, and an updraft strongest on the axis. The funnel flares with height and\n// meanders as it climbs - a straight vertical cylinder reads as a spinning\n// bottle rather than as a storm.\n\n#define TORNADO_CORE 0.16      // core radius, in units of uExtent\n\n// Lateral wander of the funnel axis at normalised height u.\nvec3 sfxTornadoAxis(float u) {\n    float t = uTime * uSpin * 0.45;\n    return vec3(sin(u * 2.1 + t) + 0.40 * sin(u * 4.3 - t * 0.7),\n                0.0,\n                cos(u * 1.7 + t * 0.8) + 0.35 * cos(u * 3.9 + t * 0.5));\n}\n\nvec3 sfxTornado(vec3 p) {\n    vec3  ax = vec3(0.0, 1.0, 0.0);\n    vec3  d  = p - uPivot;\n    float h0 = dot(d, ax);\n    vec3  rad = d - ax * h0;\n    float r  = length(rad) + 1e-5;\n    vec3  er = rad / r;\n    vec3  et = cross(ax, er);\n\n    uint s = gSeed;\n\n    // debris is picked up from the ground up, softened by a per-splat offset so\n    // the intake is a ragged front rather than a rising plane\n    float y0 = clamp(h0 / (uExtent * 1.6) + 0.5, 0.0, 1.0);\n    float k  = sfxSmooth(sfxStagger(uProg, mix(y0, sfxRnd(s), 0.35), 0.55));\n\n    // Where in the column this splat ends up: its own buoyancy, biased toward\n    // the top for material near the axis, since that is where the updraft is\n    // strongest. The per-splat term is load-bearing — send every splat to the\n    // same place and the funnel collapses into a disc.\n    //\n    // The bias is a power on the uniform rather than a blend toward it: pow()\n    // maps [0,1] onto [0,1], so the column still occupies its full stated\n    // height. Blending toward an axis term instead truncates the range, and the\n    // finished column comes out well short of the span below.\n    float rn0   = r / uExtent;\n    float draft = 1.0 / (1.0 + rn0 * rn0 * 2.0);\n    float place = pow(sfxRnd(s), mix(1.6, 0.6, draft));\n\n    // The finished column stands uHeight * 2 tall at an Updraft of 1 — twice the\n    // capture's own height, whatever that capture is — and is centred on the\n    // pivot rather than standing on it. There is no ground plane in the scene,\n    // so where the funnel's foot sits is a framing choice, not a physical one.\n    //\n    // Height is measured, not inferred from uExtent: the radius cannot tell a\n    // tall capture from a squat one, and a tornado scaled off it would be the\n    // wrong shape for either.\n    float span = uHeight * 2.0 * max(uAmp, 0.05);\n    float hn   = mix(h0, (place - 0.5) * span, k);\n\n    // funnel wall: a tight tip at the foot, flaring with height\n    float u  = clamp(hn / max(span, 1e-4) + 0.5, 0.0, 1.0);\n    float rf = uExtent * (TORNADO_CORE * 0.55 + max(uFreq, 0.0) * 0.20 * pow(u, 1.5));\n\n    // The sweep is taken on the smooth wall, before the debris scatter below.\n    // Scattering first would give neighbouring splats different radii and so\n    // different swept angles, and the helix washes out into a featureless plume.\n    float rWall = mix(r, rf, k);\n    float rn1   = rWall / uExtent;\n\n    float rc = TORNADO_CORE;\n    float sweep = k / max(max(rn0, rc) * max(rn1, rc), 1e-4);\n    // The second term twists the wall with height. The vortex sweep alone is a\n    // function of radius only, which stacks rings; a funnel is a helical sheet,\n    // and that is what makes the debris trails legible as rotation.\n    float swept = uSpin * (14.0 * rc * rc * sweep + 2.2 * k * hn / uExtent);\n\n    // Both terms above are functions of progress, so parking the timeline would\n    // freeze the funnel solid — the one effect here that must not stop turning.\n    // The Rankine profile applies to this term too: the tip winds several times\n    // faster than the flare, so the column shears as it spins.\n    float dtheta = swept + uTime * uSpin * 1.3 * k * clamp(rc / max(rn1, rc), 0.2, 1.0);\n\n    // Scattered across the wall, so it is a shell of debris and not a drawn\n    // surface — but kept tight: fill the interior and the funnel renders as a\n    // solid cone instead of a shell whose limb brightens where it is edge-on.\n    float rNew = rWall * (1.0 + (sfxRnd(s) * 2.0 - 1.0) * clamp(uTurb, 0.0, 1.0) * 0.45 * k);\n\n    vec3 eDir = er * cos(dtheta) + et * sin(dtheta);\n    vec3 eTan = et * cos(dtheta) - er * sin(dtheta);\n\n    vec3 pos = uPivot + ax * hn + eDir * rNew\n             + sfxTornadoAxis(u) * uExtent * 0.15 * clamp(uTurb, 0.0, 1.0) * k;\n\n    // Tangential sweep + radial infall + updraft, for the streak direction, but\n    // weighted rather than taken raw: the infall is by far the largest term and\n    // at full strength every splat draws a spoke through the axis, which reads\n    // as a starburst instead of as rotation.\n    // swept, not dtheta: the streak stands for how far this splat has travelled\n    // during the transition, and folding in the free-running spin would grow\n    // every streak without bound the longer the demo is left open.\n    vec3  vel = eTan * (rNew * swept)\n              + eDir * (rNew - r) * 0.30\n              + ax * (hn - h0) * 0.55;\n    float sp  = length(vel);\n\n    gDisp    = k;\n    gVel     = vel / max(sp, 1e-5);\n    gStretch = uSizeGain * clamp(sp / (uExtent * 2.4), 0.0, 1.8);\n    // the core is where the rate is capped and the shear against the free\n    // vortex outside it is highest, so that is what lights up\n    gEdge    = clamp(rc / max(rn1, rc), 0.0, 1.0) * k * (1.0 - k) * 3.2;\n    return pos;\n}\n\n\n// ========================================================== dispatcher ======\n\nint sfxId() { return int(uEffect + 0.5); }\n\nvoid modifySplatCenter(inout vec3 center) {\n    gSeed = sfxSeedPos(center);\n\n    if (uProg <= 0.0) return;       // exact identity when fully assembled\n\n    int id = sfxId();\n    if      (id == 0) center = sfxMcmc(center);\n    else if (id == 1) center = sfxDiffusion(center);\n    else if (id == 2) center = sfxCurlFlow(center);\n    else if (id == 3) center = sfxHarmonic(center);\n    else if (id == 4) center = sfxVortex(center);\n    else if (id == 5) center = sfxShockwave(center);\n    else if (id == 6) center = sfxShatter(center);\n    else if (id == 7) center = sfxPhyllotaxis(center);\n    else if (id == 8) center = sfxWipe(center);\n    else if (id == 9) center = sfxMelt(center);\n    else if (id == 10) center = sfxWind(center);\n    else if (id == 11) center = sfxChladni(center);\n    else if (id == 12) center = sfxNBody(center);\n    else if (id == 13) center = sfxLattice(center);\n    else if (id == 14) center = sfxHelix(center);\n    else if (id == 15) center = sfxBeamUp(center);\n    else if (id == 16) center = sfxFibSphere(center);\n    else if (id == 17) center = sfxTornado(center);\n}\n\n// Energy compensation. Without it every size-gain effect blows out to white:\n// 165k additively-blended splats that each grew 3x cover ~9x the pixels.\n// Area alone under-corrects needles (a long thin gaussian has small area but\n// crosses a lot of screen), so the longest principal radius is penalised too.\nfloat sfxArea(vec3 s) { return s.x * s.y + s.y * s.z + s.z * s.x; }\nfloat sfxMaxc(vec3 s) { return max(max(s.x, s.y), s.z); }\n\n// Alpha correction for a scale change, relative to a reference scale. Growing\n// darkens, shrinking is left alone (the clamp caps it at 1) — losing coverage\n// is compensated by uPointGain instead, not here.\nfloat sfxEnergy(vec3 before, vec3 after) {\n    float areaRatio = sfxArea(before) / max(sfxArea(after), 1e-12);\n    float lenRatio  = sfxMaxc(before) / max(sfxMaxc(after), 1e-12);\n    return clamp(pow(min(areaRatio, lenRatio), 0.6), 0.05, 1.0);\n}\n\nvoid modifySplatRotationScale(vec3 originalCenter, vec3 modifiedCenter,\n                              inout vec4 rotation, inout vec3 scale) {\n    vec3 scale0 = scale;\n\n    // Note: the point-cloud branch below has to run even at uProg == 0, so this\n    // function cannot early-out on progress the way the others do.\n    if (uProg > 0.0) {\n\n    // rigid shard rotation composes onto the splat's own orientation\n    rotation = quatMul(gSpinQ, rotation);\n\n    if (gMelt) {\n        // drive the covariance anisotropic along its dominant eigenvector\n        float k = uProg;\n        float grow   = 1.0 + k * uSizeGain * 6.0;\n        float shrink = 1.0 - k * 0.88;\n        float m = max(max(scale.x, scale.y), scale.z);\n        vec3  sel = step(m - 1e-9, scale);\n        scale *= mix(vec3(shrink), vec3(grow), sel);\n    } else if (gStretch > 0.001) {\n        // stretch along a world-space direction: grow whichever local axis is\n        // most aligned with gVel, so the gaussian elongates into a streak\n        // along its direction of travel\n        mat3 R = quatToMat3(rotation);\n        vec3 v = normalize(gVel);\n        vec3 al = abs(vec3(dot(R[0], v), dot(R[1], v), dot(R[2], v)));\n        float mx = max(max(al.x, al.y), al.z);\n        vec3 sel = step(mx - 1e-6, al);\n        float k = min(1.0 + gStretch * 3.5, 14.0);\n        scale *= mix(vec3(1.0), vec3(k), sel);\n    }\n\n    scale *= clamp(gInflate, 0.05, 8.0);\n    scale *= (1.0 - gHide);\n\n    }   // end if (uProg > 0.0)\n\n    // Point-cloud mode: throw away the per-splat covariance and draw every\n    // gaussian as the same small sphere. gsplatMakeSpherical is the engine's own\n    // helper for exactly this.\n    //\n    // With Blend to 3DGS on, the two representations are crossfaded rather than\n    // switched: both are built here and mixed by sfxPointMix(), so the cloud\n    // resolves out of uniform dust into the real capture as it assembles. At\n    // mix 1 every term below collapses to exactly the pure point path.\n    float pm = sfxPointMix();\n    if (pm > 0.0) {\n        // the gaussian side: this splat's own covariance, as the effect left it\n        vec3  gScale = scale;\n        float gComp  = uProg > 0.0 ? sfxEnergy(scale0, gScale) : 1.0;\n\n        // the point side\n        float sz = uPointSize * uExtent * clamp(gInflate, 0.3, 3.0) * (1.0 - gHide);\n        vec3  pScale = scale;\n        gsplatMakeSpherical(pScale, sz);\n        vec4  pRot  = rotation;\n        float pComp = 1.0;\n\n        // An effect asking for a streak still gets one: a sphere has no\n        // meaningful orientation, so point the local X axis along gVel and\n        // elongate that axis. This is what gives beam columns and wind trails.\n        if (gStretch > 0.001) {\n            vec3 v = normalize(gVel);\n            vec3 axis = cross(vec3(1.0, 0.0, 0.0), v);\n            float al = length(axis);\n            if (al < 1e-5) {\n                // v is already (anti)parallel to X; the ellipsoid is symmetric,\n                // so identity is correct for either sign\n                pRot = vec4(0.0, 0.0, 0.0, 1.0);\n            } else {\n                pRot = sfxQuatAxis(axis / al, atan(al, v.x));\n            }\n\n            pScale = vec3(sz * (1.0 + gStretch * 3.0), sz, sz);\n            // reference is the unstretched dot, not the source gaussian: within\n            // point mode the streak is what has to be paid for\n            pComp = sfxEnergy(vec3(sz), pScale);\n        }\n\n        scale = mix(gScale, pScale, pm);\n        // the two sides do not share a frame — the dot is aligned to velocity,\n        // the gaussian to its own eigenvectors. Nothing meaningful lies between\n        // them, so this only has to be continuous in pm.\n        rotation = sfxQuatNlerp(rotation, pRot, pm);\n        gAlphaComp = mix(gComp, pComp, pm);\n        return;\n    }\n\n    if (uProg <= 0.0) return;\n\n    gAlphaComp = sfxEnergy(scale0, scale);\n}\n\nvoid modifySplatColor(vec3 center, inout vec4 color) {\n    // Shrinking a big soft gaussian down to a point throws away most of its\n    // coverage, so point mode needs its opacity back to stay legible. The gain\n    // rides the same crossfade as the geometry, or the blend would arrive at\n    // the assembled end with the capture's own gaussians overbright.\n    float pm = sfxPointMix();\n    if (pm > 0.0) color.a = min(1.0, color.a * mix(1.0, uPointGain, pm));\n\n    if (uProg <= 0.0) return;\n\n    float d = clamp(gDisp, 0.0, 1.0);\n    float e = clamp(gEdge, 0.0, 1.0);\n\n    // Global clear-out: a transition-out has to actually clear the frame, so\n    // opacity is driven by uProg itself and only modulated by the per-splat\n    // dispersion term. gAlphaComp keeps inflated splats from saturating.\n    float clear = 1.0 - uFade * smoothstep(0.0, 0.9, uProg) * mix(0.6, 1.0, d);\n    color.a *= (1.0 - gHide) * clear * gAlphaComp;\n\n    // dispersed splats lose local colour and take on the energy tint, and the\n    // wavefront/seam band emits on top of that. Both terms stay deliberately\n    // low: 165k additively-blended splats saturate to white very easily.\n    color.rgb = mix(color.rgb, uTint, clamp(d * uGlow * 0.28, 0.0, 0.65));\n    color.rgb += uTint * e * uGlow * 0.75;\n}\n";
+const FRAGMENT_GLSL = "\nuniform float uFalloff;   // 1 = untouched\nuniform float uRim;       // rim emission at the gaussian's edge\nuniform vec3  uRimTint;\n\nvoid modifySplatColor(vec2 gaussianUV, inout vec4 color) {\n    float r = clamp(length(gaussianUV), 0.0, 1.0);\n    if (abs(uFalloff - 1.0) > 0.001) {\n        color.a = pow(clamp(color.a, 0.0, 1.0), max(uFalloff, 0.02));\n    }\n    if (uRim > 0.001) {\n        color.rgb += uRimTint * uRim * pow(r, 3.0);\n    }\n}\n";
+const EASINGS = { linear:e=>e, "ease in":e=>e*e*e, "ease out":e=>1-(1-e)**3, "ease in-out":e=>e<.5?4*e*e*e:1-(-2*e+2)**3/2 };
+
+const bootEl = document.getElementById('boot');
+const msgEl = document.getElementById('msg');
+
+const fail = (e) => {
+    console.error(e);
+    bootEl.classList.add('fail');
+    bootEl.classList.remove('gone');
+    msgEl.textContent = String(e && e.message || e);
+};
+
+/** base64 text node -> bytes, chunked so a large capture stays responsive. */
+function decode(id) {
+    const b64 = document.getElementById(id).textContent.trim();
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+async function gunzip(bytes) {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/**
+ * Brings the inlined engine to life. Indirect eval, so the UMD wrapper runs in
+ * global scope and publishes itself as globalThis.pc — deliberately not a
+ * module import from a blob: URL, which a page opened from file:// is not
+ * allowed to do.
+ */
+function loadEngine(bytes) {
+    (0, eval)(new TextDecoder().decode(bytes));
+    if (!globalThis.pc) throw new Error('the embedded engine did not load');
+    return globalThis.pc;
+}
+
+// Everything below lives inside one function because the inlined modules run
+// top-level code the moment they are evaluated — orbit-camera.js allocates its
+// scratch vectors at module scope — so they cannot be evaluated until the
+// engine has been unpacked and Vec2/Vec3/math exist. A single shared scope is
+// also what lets them see each other the way their imports used to.
+async function main() {
+    msgEl.textContent = 'Unpacking the engine…';
+    let engineBytes = await decode('engine-payload');
+    if (CFG.gz.engine) engineBytes = await gunzip(engineBytes);
+
+    msgEl.textContent = 'Unpacking the capture…';
+    let splatBytes = await decode('splat-payload');
+    if (CFG.gz.splat) splatBytes = await gunzip(splatBytes);
+
+    // several MB of base64 released before the engine starts allocating
+    document.getElementById('engine-payload').remove();
+    document.getElementById('splat-payload').remove();
+
+    const pc = loadEngine(engineBytes);
+    const { Vec2, Vec3, math } = pc;
+
+
+    const STATE = {
+        IN: 'in',            // 1 -> 0, assembling
+        ASSEMBLED: 'assembled',
+        OUT: 'out',          // 0 -> 1, dispersing
+        DISPERSED: 'dispersed',
+        HELD: 'held'         // parked mid-transition by the progress slider
+    };
+
+    /**
+     * Drives the single `progress` value that every effect reads: 0 = assembled,
+     * 1 = fully dispersed. Handles both directions plus an auto-cycle mode that
+     * dwells at each end and (optionally) advances to the next effect while the
+     * scene is hidden.
+     */
+    class Transition {
+        constructor(opts = {}) {
+            this.duration = opts.duration ?? 2.2;
+            this.easing = opts.easing ?? 'ease in-out';
+            this.dwell = opts.dwell ?? 1.0;
+            this.advanceOnCycle = opts.advanceOnCycle ?? true;
+
+            this.state = STATE.ASSEMBLED;
+            this.raw = 0;            // un-eased 0..1
+            this.progress = 0;       // eased 0..1, what the shader sees
+            this.timer = 0;
+
+            // state fields first: the setter primes the timeline
+            this._autoCycle = false;
+            this.autoCycle = opts.autoCycle ?? false;
+
+            /** Fired with the completed state. */
+            this.onSettle = null;
+            /** Fired when auto-cycle wants the next effect. */
+            this.onAdvance = null;
+        }
+
+        get busy() {
+            return this.state === STATE.IN || this.state === STATE.OUT;
+        }
+
+        get autoCycle() {
+            return this._autoCycle;
+        }
+
+        /**
+         * Turning auto-cycle on leads with an In, so the viewer sees the effect
+         * assemble rather than the object it was already looking at fall apart.
+         * Every later effect already leads with In, because the swap happens at the
+         * dispersed end of the previous one.
+         */
+        set autoCycle(value) {
+            const on = !!value;
+            if (on === this._autoCycle) return;
+            this._autoCycle = on;
+            if (on) this.restartIn();
+        }
+
+        /**
+         * Jumps to the dispersed end without animating and immediately assembles
+         * from there. The jump is barely visible, because a dispersed effect is
+         * mostly faded out by definition.
+         */
+        restartIn() {
+            if (this.state === STATE.IN) return;   // already assembling
+            this.raw = 1;
+            this.state = STATE.IN;
+            this.timer = 0;
+            this._apply();
+        }
+
+        out() {
+            if (this.state === STATE.OUT || this.state === STATE.DISPERSED) return;
+            this.state = STATE.OUT;
+        }
+
+        in() {
+            if (this.state === STATE.IN || this.state === STATE.ASSEMBLED) return;
+            this.state = STATE.IN;
+        }
+
+        toggle() {
+            // from a held mid-point, continue in whichever direction is further away
+            if (this.state === STATE.HELD) return this.raw > 0.5 ? this.out() : this.in();
+            if (this.state === STATE.OUT || this.state === STATE.DISPERSED) this.in();
+            else this.out();
+        }
+
+        /**
+         * Jump straight to a raw progress value (slider scrubbing). Parks the
+         * timeline: scrubbing to the middle must not resume playing.
+         */
+        scrub(v) {
+            this.raw = Math.min(1, Math.max(0, v));
+            this.state = this.raw <= 0 ? STATE.ASSEMBLED
+                : this.raw >= 1 ? STATE.DISPERSED : STATE.HELD;
+            this.timer = 0;
+            this._apply();
+        }
+
+        reset() {
+            this.raw = 0;
+            this.state = STATE.ASSEMBLED;
+            this.timer = 0;
+            this._apply();
+        }
+
+        _apply() {
+            const ease = EASINGS[this.easing] ?? EASINGS.linear;
+            this.progress = Math.min(1, Math.max(0, ease(this.raw)));
+        }
+
+        update(dt) {
+            const step = dt / Math.max(this.duration, 0.05);
+
+            if (this.state === STATE.OUT) {
+                this.raw += step;
+                if (this.raw >= 1) {
+                    this.raw = 1;
+                    this.state = STATE.DISPERSED;
+                    this.timer = 0;
+                    this.onSettle?.(this.state);
+                }
+            } else if (this.state === STATE.IN) {
+                this.raw -= step;
+                if (this.raw <= 0) {
+                    this.raw = 0;
+                    this.state = STATE.ASSEMBLED;
+                    this.timer = 0;
+                    this.onSettle?.(this.state);
+                }
+            } else if (this.autoCycle) {
+                this.timer += dt;
+                if (this.timer >= this.dwell) {
+                    this.timer = 0;
+                    if (this.state === STATE.DISPERSED) {
+                        // swap effects while nothing is visible, then reassemble
+                        if (this.advanceOnCycle) this.onAdvance?.();
+                        this.in();
+                    } else {
+                        this.out();
+                    }
+                }
+            }
+
+            this._apply();
+        }
+    }
+
+
+    /** Fraction dropped from each end of an axis when measuring its extent. */
+    const EXTENT_TRIM = 0.001;
+
+    /**
+     * Locates the centre and radius of a splat cloud from its actual splat centres.
+     *
+     * The resource AABB is not a good substitute for either. It is padded to enclose
+     * every gaussian's *extent*, so a handful of large or stray splats pull its
+     * centre off the cloud and inflate its size — and its half-extent length is a
+     * box diagonal, which overstates the radius by up to √3. Percentiles of the
+     * centre positions ignore the outliers and give an honest centre and radius.
+     *
+     * Every effect reads `uPivot`/`uExtent`, so this is the one place that decides
+     * where "the middle of the object" is and how big it is.
+     *
+     * @param {import('playcanvas').GSplatResourceBase|null} resource - Loaded splat resource.
+     * @param {import('playcanvas').Mat4} worldMatrix - The splat entity's world transform.
+     * @param {{ trim?: number, cover?: number }} [opts] - `trim` is the fraction of
+     * splats discarded from each end of each axis before taking the midpoint;
+     * `cover` is the fraction of splats the radius must enclose.
+     * @returns {{ pivot: Vec3, extent: number, size: Vec3, robust: boolean }}
+     * Centre in world space, radius and per-axis extents in world units, and whether
+     * splat centres were available.
+     */
+    function measureSplatCloud(resource, worldMatrix, opts = {}) {
+        const trim = opts.trim ?? 0.015;
+        const cover = opts.cover ?? 0.98;
+
+        const s = worldMatrix.getScale();
+        const scale = Math.max(s.x, s.y, s.z);
+
+        const centers = resource?.hasCenters ? resource.centers : null;
+        if (!centers || centers.length < 3) {
+            // centres can be disabled via scene.gsplatCentersEnabled; fall back to
+            // the AABB and accept the padding
+            const aabb = resource?.aabb;
+            const h = aabb ? aabb.halfExtents : new Vec3(1, 1, 1);
+            return {
+                pivot: aabb ? worldMatrix.transformPoint(aabb.center.clone()) : new Vec3(),
+                extent: Math.max((aabb ? aabb.halfExtents.length() : 1) * scale, 1e-3),
+                size: worldSize(worldMatrix, [h.x, h.y, h.z]),
+                robust: false
+            };
+        }
+
+        const n = centers.length / 3;
+
+        // Per-axis trimmed midpoint: the centre of the box that holds all but the
+        // outermost `trim` of splats on each side. The same sorted lanes also give
+        // the per-axis half-extents, which the radius alone cannot — a tall capture
+        // and a squat one of the same radius are very different objects.
+        //
+        // Those extents use a far tighter trim, because they answer a different
+        // question. `trim` exists to stop a handful of strays dragging the centre or
+        // inflating the radius; the extents are what a viewer actually sees edge to
+        // edge, and discarding 1.5% off each end visibly undersells the capture.
+        const mid = [0, 0, 0];
+        const half = [0, 0, 0];
+        const lane = new Float32Array(n);
+        for (let a = 0; a < 3; a++) {
+            for (let i = 0; i < n; i++) lane[i] = centers[i * 3 + a];
+            lane.sort();
+            mid[a]  = (pick(lane, trim) + pick(lane, 1 - trim)) * 0.5;
+            half[a] = (pick(lane, 1 - EXTENT_TRIM) - pick(lane, EXTENT_TRIM)) * 0.5;
+        }
+
+        // radius about that midpoint enclosing `cover` of the splats
+        const dist = new Float32Array(n);
+        for (let i = 0; i < n; i++) {
+            const dx = centers[i * 3] - mid[0];
+            const dy = centers[i * 3 + 1] - mid[1];
+            const dz = centers[i * 3 + 2] - mid[2];
+            dist[i] = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        dist.sort();
+
+        return {
+            pivot: worldMatrix.transformPoint(new Vec3(mid[0], mid[1], mid[2])),
+            extent: Math.max(pick(dist, cover) * scale, 1e-3),
+            size: worldSize(worldMatrix, half),
+            robust: true
+        };
+    }
+
+    /**
+     * World-space extents of a local-space half-extent box. Along each world axis,
+     * every local axis contributes its own length times how much of it points that
+     * way — the standard bound for a box under rotation — so the answer holds
+     * whatever orientation the capture was given, including the 180° roll that
+     * .sog captures need.
+     *
+     * @param {import('playcanvas').Mat4} worldMatrix - The splat entity's transform.
+     * @param {number[]} half - Local-space half-extents, [x, y, z].
+     * @returns {Vec3} Full width, height and depth in world units.
+     */
+    function worldSize(worldMatrix, half) {
+        // column-major: column i is local axis i transformed, scale included, so
+        // m[i * 4 + j] is how much of local axis i points along world axis j
+        const m = worldMatrix.data;
+        const along = j => Math.max(
+            2 * (Math.abs(m[j]) * half[0] + Math.abs(m[4 + j]) * half[1] + Math.abs(m[8 + j]) * half[2]),
+            1e-3
+        );
+        return new Vec3(along(0), along(1), along(2));
+    }
+
+    /** Value at fractional position `p` of an ascending sorted array. */
+    function pick(sorted, p) {
+        const i = Math.round((sorted.length - 1) * p);
+        return sorted[Math.min(sorted.length - 1, Math.max(0, i))];
+    }
+
+
+    // scratch, so the per-frame commit allocates nothing
+    const _focus = new Vec3();
+    const _eye = new Vec3();
+    const _dir = new Vec3();
+    const _fwd = new Vec3();
+    const _right = new Vec3();
+    const _up = new Vec3();
+    const _off = new Vec3();
+    const _tmp = new Vec3();
+
+    /**
+     * Minimal damped orbit camera: LMB/1-finger drag to orbit, wheel/pinch to zoom,
+     * RMB (or middle, or shift-drag) / 2-finger drag to pan. Kept self-contained so
+     * the demo has no dependency on the engine's evolving input-controller API.
+     *
+     * `target` is the orbit centre and stays put: panning offsets the *camera* (eye
+     * and look-at together), so the view slides without moving the point rotation
+     * happens about. Panning and then orbiting therefore still turns the object
+     * around its own centre rather than about wherever the pan left off.
+     *
+     * `setFocusOffset` shifts where on screen the target lands, in CSS pixels. It is
+     * recomputed from the current camera basis every frame, so unlike the user's pan
+     * it is screen-locked and survives orbiting — which is what a fixed UI panel
+     * covering part of the canvas needs.
+     */
+    class OrbitCamera {
+        constructor(entity, canvas, opts = {}) {
+            this.entity = entity;
+            this.canvas = canvas;
+
+            this.target = new Vec3(opts.target ?? [0, 0, 0]);
+            this.distance = opts.distance ?? 4;
+            this.minDistance = opts.minDistance ?? 0.2;
+            this.maxDistance = opts.maxDistance ?? 200;
+            this.yaw = opts.yaw ?? 30;
+            this.pitch = opts.pitch ?? -18;
+            this.autoRotate = opts.autoRotate ?? 0;      // deg/sec
+
+            this._tYaw = this.yaw;
+            this._tPitch = this.pitch;
+            this._tDist = this.distance;
+
+            // view offset from panning; never folded into `target`
+            this.pan = new Vec3();
+            this._tPan = new Vec3();
+
+            // where the target should sit on screen, in CSS px from centre
+            this.focusOffset = new Vec2();
+            this._tFocusOffset = new Vec2();
+
+            this._damp = 0.12;
+
+            this._pointers = new Map();
+            this._mode = null;
+            // d and cx/cy are the two-finger gesture's spread and centroid, which
+            // drive zoom and pan respectively
+            this._last = { x: 0, y: 0, d: 0, cx: 0, cy: 0 };
+
+            this._bind();
+            this._commit();
+        }
+
+        _bind() {
+            const c = this.canvas;
+            c.style.touchAction = 'none';
+
+            c.addEventListener('pointerdown', (e) => {
+                c.setPointerCapture(e.pointerId);
+                this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+                this._mode = (e.button === 1 || e.button === 2 || e.shiftKey) ? 'pan' : 'orbit';
+                this._last.x = e.clientX;
+                this._last.y = e.clientY;
+                if (this._pointers.size === 2) {
+                    this._mode = 'pinch';
+                    Object.assign(this._last, this._gesture());
+                }
+            });
+
+            c.addEventListener('pointermove', (e) => {
+                if (!this._pointers.has(e.pointerId)) return;
+                const prev = this._pointers.get(e.pointerId);
+                this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+                // Two fingers do both jobs at once, which is what the gesture
+                // actually is: the spread between them zooms, and wherever their
+                // midpoint goes the view follows. Handling only the spread — as
+                // this did — left touch with no way to pan at all, since the
+                // modifier keys and extra mouse buttons the pan is otherwise bound
+                // to do not exist on a phone.
+                if (this._mode === 'pinch' && this._pointers.size === 2) {
+                    const { d, cx, cy } = this._gesture();
+                    // Ratio, not pixel delta: pinching the same physical distance
+                    // should zoom the same amount on a phone as on a tablet, and a
+                    // spread that doubles the gap should halve the orbit distance.
+                    if (d > 0 && this._last.d > 0) this._zoomBy(this._last.d / d);
+                    this._pan(cx - this._last.cx, cy - this._last.cy);
+                    this._last.d = d;
+                    this._last.cx = cx;
+                    this._last.cy = cy;
+                    return;
+                }
+
+                const dx = e.clientX - prev.x;
+                const dy = e.clientY - prev.y;
+                if (this._mode === 'pan') this._pan(dx, dy);
+                else {
+                    this._tYaw -= dx * 0.35;
+                    // vertical drag is inverted: dragging down tilts the view down
+                    this._tPitch = math.clamp(this._tPitch + dy * 0.35, -89.9, 89.9);
+                }
+            });
+
+            const up = (e) => {
+                this._pointers.delete(e.pointerId);
+                if (this._pointers.size === 0) this._mode = null;
+                else if (this._pointers.size === 1) this._mode = 'orbit';
+            };
+            c.addEventListener('pointerup', up);
+            c.addEventListener('pointercancel', up);
+            c.addEventListener('contextmenu', e => e.preventDefault());
+
+            c.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                this._zoom(e.deltaY * 0.0015);
+            }, { passive: false });
+        }
+
+        /** Spread and midpoint of the two active pointers, in client pixels. */
+        _gesture() {
+            const [a, b] = [...this._pointers.values()];
+            return {
+                d: Math.hypot(a.x - b.x, a.y - b.y),
+                cx: (a.x + b.x) * 0.5,
+                cy: (a.y + b.y) * 0.5
+            };
+        }
+
+        _zoom(amount) {
+            this._zoomBy(1 + amount * 1.8);
+        }
+
+        /** Scales the orbit distance directly — 2 is twice as far out. */
+        _zoomBy(factor) {
+            this._tDist = math.clamp(this._tDist * factor, this.minDistance, this.maxDistance);
+        }
+
+        // Screen-space drag -> camera offset. Moves the eye only; `target` is left
+        // alone so the orbit centre stays on the object.
+        _pan(dx, dy) {
+            const scale = this._tDist * 0.0018;
+            this._tPan.add(_tmp.copy(this.entity.right).mulScalar(-dx * scale));
+            this._tPan.add(_tmp.copy(this.entity.up).mulScalar(dy * scale));
+        }
+
+        /** Undo any panning, returning the orbit centre to the middle of the view. */
+        recenter() {
+            this._tPan.set(0, 0, 0);
+        }
+
+        /**
+         * Offsets where the orbit centre appears on screen, in CSS pixels. Used to
+         * keep the subject in the middle of the area a UI panel is not covering.
+         * Damped, so showing or hiding the panel slides rather than jumps.
+         */
+        setFocusOffset(x, y = 0) {
+            this._tFocusOffset.set(x, y);
+        }
+
+        /**
+         * World-space displacement that moves the target `focusOffset` pixels across
+         * the screen. Derived from the view plane's world size at the orbit distance,
+         * so it holds at any zoom level.
+         */
+        _framingOffset(out) {
+            out.set(0, 0, 0);
+            const px = this.focusOffset;
+            if (px.x === 0 && px.y === 0) return out;
+
+            const w = this.canvas.clientWidth || 1;
+            const h = this.canvas.clientHeight || 1;
+            const fov = this.entity.camera?.fov ?? 45;
+            const viewH = 2 * this.distance * Math.tan(fov * 0.5 * math.DEG_TO_RAD);
+            const viewW = viewH * (w / h);
+
+            // moving the camera left puts the target further right on screen
+            out.add(_tmp.copy(_right).mulScalar(-(px.x / w) * viewW));
+            out.add(_tmp.copy(_up).mulScalar(-(px.y / h) * viewH));
+            return out;
+        }
+
+        /**
+         * Frames a sphere: puts the orbit centre on it, drops any pan, and rescales
+         * the zoom limits to its radius. Loading a different model goes through
+         * here, so every cloud is framed by the same rule whatever its size.
+         *
+         * @param {Vec3} center - Orbit centre, world space.
+         * @param {number} radius - Radius of the subject, world units.
+         * @param {{fit?: number, min?: number, max?: number, snap?: boolean}} [opts] -
+         * Multiples of `radius` for the orbit distance and the two zoom limits.
+         * `snap` lands on the new distance immediately instead of easing to it.
+         */
+        frame(center, radius, opts = {}) {
+            this.target.copy(center);
+            this._tPan.set(0, 0, 0);
+            this.minDistance = radius * (opts.min ?? 0.15);
+            this.maxDistance = radius * (opts.max ?? 40);
+            this._tDist = math.clamp(radius * (opts.fit ?? 3.7), this.minDistance, this.maxDistance);
+            if (opts.snap) {
+                this.pan.set(0, 0, 0);
+                this.distance = this._tDist;
+                this._commit();
+            }
+        }
+
+        _commit() {
+            const p = this.pitch * math.DEG_TO_RAD;
+            const y = this.yaw * math.DEG_TO_RAD;
+            const cp = Math.cos(p);
+            _dir.set(cp * Math.sin(y), Math.sin(p), cp * Math.cos(y));
+
+            // Exact basis from yaw/pitch. `right` is horizontal by construction and
+            // always perpendicular to the view direction, so this has none of the
+            // pole degeneracy of cross(forward, worldUp).
+            _right.set(Math.cos(y), 0, -Math.sin(y));
+            _fwd.copy(_dir).mulScalar(-1);
+            _up.cross(_right, _fwd);
+
+            // Orbit about the fixed target, then displace eye and look-at by the
+            // same offsets: the view translates, the orbit centre does not.
+            _focus.copy(this.target).add(this.pan).add(this._framingOffset(_off));
+            _eye.copy(_focus).add(_dir.mulScalar(this.distance));
+
+            this.entity.setPosition(_eye);
+            this.entity.lookAt(_focus);
+        }
+
+        update(dt) {
+            if (this.autoRotate && this._mode === null) {
+                this._tYaw += this.autoRotate * dt;
+            }
+            // exponential smoothing, frame-rate independent
+            const a = 1 - Math.pow(1 - this._damp, dt * 60);
+            this.yaw += (this._tYaw - this.yaw) * a;
+            this.pitch += (this._tPitch - this.pitch) * a;
+            this.distance += (this._tDist - this.distance) * a;
+            this.pan.lerp(this.pan, this._tPan, a);
+            this.focusOffset.lerp(this.focusOffset, this._tFocusOffset, a);
+            this._commit();
+        }
+    }
+
+    /**
+     * The single place the shader's uniform block is filled in.
+     *
+     * Extracted from main.js's update loop because the standalone viewer that
+     * `export/bundle.js` produces inlines this same file: a uniform added here
+     * reaches the exported player without anyone remembering to add it twice, which
+     * is the one kind of drift that would make an export silently render
+     * differently from the app it was exported from.
+     *
+     * Deliberately knows nothing about the app: no ui, no transition object, no
+     * asset. It takes the values and writes them.
+     */
+
+    /** Smoothstep on a 0..1 ramp — the JS twin of the shader's sfxSmooth. */
+    const smooth01 = (t) => {
+        t = Math.min(1, Math.max(0, t));
+        return t * t * (3 - 2 * t);
+    };
+
+    // scratch, so the per-frame call allocates nothing
+    const _tint = [0, 0, 0];
+    const _pivot = [0, 0, 0];
+
+    /**
+     * Writes one frame's worth of uniforms onto the work-buffer modifier and the
+     * render material.
+     *
+     * @param {object} g - The entity's `gsplat` component.
+     * @param {object} material - `app.scene.gsplat.material`, which carries the
+     * fragment-stage uniforms.
+     * @param {object} s - Frame state: `time`, `progress`, `effectIndex`, `params`,
+     * `splatCount`, and the measured cloud (`pivot`, `extent`, `height`, `width`).
+     * @returns {{pointSize: number}} The resolved point size, in world units, which
+     * the caller needs for the renderer's culling thresholds.
+     */
+    function feedSplatUniforms(g, material, s) {
+        const p = s.params;
+
+        g.setParameter('uTime', s.time);
+        g.setParameter('uProg', s.progress);
+        g.setParameter('uEffect', s.effectIndex);
+        _pivot[0] = s.pivot.x; _pivot[1] = s.pivot.y; _pivot[2] = s.pivot.z;
+        g.setParameter('uPivot', _pivot);
+        g.setParameter('uExtent', s.extent);
+        g.setParameter('uHeight', s.height);
+        g.setParameter('uWidth', s.width);
+        g.setParameter('uAmp', p.amp);
+        g.setParameter('uFreq', p.freq);
+        g.setParameter('uTurb', p.turb);
+        g.setParameter('uSpin', p.spin);
+        g.setParameter('uSizeGain', p.sizeGain);
+        g.setParameter('uFade', p.fade);
+        g.setParameter('uGlow', p.glow);
+        _tint[0] = p.tint[0]; _tint[1] = p.tint[1]; _tint[2] = p.tint[2];
+        g.setParameter('uTint', _tint);
+        g.setParameter('uSeed', p.seed);
+        g.setParameter('uSplatCount', s.splatCount);
+
+        // point size is authored in per-mille of the cloud's extent
+        const pointSize = (p.point ?? 0) * 0.001;
+        const pointBlend = p.pointBlend ?? 0;
+        g.setParameter('uPointSize', pointSize);
+        g.setParameter('uPointGain', p.pointGain ?? 1);
+        g.setParameter('uPointBlend', pointBlend);
+
+        // The fragment falloff is a whole-cloud uniform rather than per-splat, so
+        // when the point cloud is crossfading into the capture's gaussians the same
+        // mix is applied here, on the CPU: a dot wants the hard disc the slider asks
+        // for, a real gaussian wants its own soft footprint. sfxPointMix() in
+        // lib.glsl.js is the shader-side twin of this.
+        const falloff = p.falloff ?? 1;
+        const blending = pointSize > 0 && pointBlend > 0;
+        material.setParameter('uFalloff', blending
+            ? 1 + (falloff - 1) * smooth01(s.progress / pointBlend)
+            : falloff);
+        material.setParameter('uRim', p.rim ?? 0);
+        material.setParameter('uRimTint', _tint);
+
+        return { pointSize };
+    }
+
+    // ---------------------------------------------------------------------------
+    // The standalone viewer's own boot code.
+    //
+    // This file is never imported by the app. bundle.js reads it as raw text and
+    // concatenates it into the exported HTML, after the engine, Transition,
+    // OrbitCamera, measureSplatCloud and feedSplatUniforms — all of which are the
+    // app's real modules, inlined the same way, so an export behaves like the app
+    // it came from rather than like a reimplementation of it.
+    //
+    // Two rules follow from being concatenated rather than imported:
+    //   - no import/export statements; `pc` and the inlined classes are already in
+    //     scope by the time this runs,
+    //   - nothing here may reference the app's UI, since none of it is exported.
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Boots the viewer.
+     *
+     * @param {object} pc - The engine namespace, imported from the inlined bundle.
+     * @param {object} cfg - Everything bundle.js froze at export time: the effect
+     * index, the parameter values, the transition settings and the camera pose.
+     * @param {Blob} splatBlob - The capture, already decoded out of the page.
+     */
+    async function runViewer(pc, cfg, splatBlob) {
+        const canvas = document.getElementById('view');
+        const boot = document.getElementById('boot');
+        const msg = document.getElementById('msg');
+        const say = (t) => { msg.textContent = t; };
+
+        say('Starting WebGL2…');
+
+        // alpha:true + a transparent clearColor, so the page's CSS gradient shows
+        // through wherever nothing is rendered — same as the app.
+        const device = await pc.createGraphicsDevice(canvas, {
+            deviceTypes: [pc.DEVICETYPE_WEBGL2],
+            antialias: false,
+            depth: false,
+            alpha: true,
+            powerPreference: 'high-performance'
+        });
+        const handheld = window.matchMedia('(pointer: coarse) and (max-width: 900px)').matches;
+        device.maxPixelRatio = Math.min(window.devicePixelRatio, handheld ? 1.5 : 2);
+
+        const app = new pc.Application(canvas, { graphicsDevice: device });
+        app.setCanvasFillMode(pc.FILLMODE_NONE);
+        app.setCanvasResolution(pc.RESOLUTION_AUTO);
+
+        let resizePending = 0;
+        const resize = () => {
+            resizePending = 0;
+            const r = document.documentElement;
+            app.resizeCanvas(r.clientWidth, r.clientHeight);
+        };
+        const queueResize = () => {
+            if (!resizePending) resizePending = requestAnimationFrame(resize);
+        };
+        window.addEventListener('resize', queueResize);
+        window.addEventListener('orientationchange', queueResize);
+        window.visualViewport?.addEventListener('resize', queueResize);
+        resize();
+
+        const cameraEntity = new pc.Entity('camera');
+        cameraEntity.addComponent('camera', {
+            clearColor: new pc.Color(0, 0, 0, 0),
+            fov: cfg.camera.fov,
+            nearClip: 0.01,
+            farClip: 1000
+        });
+        app.root.addChild(cameraEntity);
+
+        const camera = new OrbitCamera(cameraEntity, canvas, {
+            yaw: cfg.camera.yaw,
+            pitch: cfg.camera.pitch,
+            autoRotate: cfg.camera.autoRotate
+        });
+
+        // ------------------------------------------------------------- the cloud
+        say('Loading capture…');
+
+        const url = URL.createObjectURL(splatBlob);
+        let asset = new pc.Asset(cfg.filename, 'gsplat', { url, filename: cfg.filename });
+        asset.urlObject = url;          // so unload() would revoke it
+        app.assets.add(asset);
+
+        await new Promise((resolve, reject) => {
+            asset.once('load', resolve);
+            asset.once('error', err => reject(new Error(String(err))));
+            app.assets.load(asset);
+        });
+
+        say('Compiling effect shader…');
+
+        const splat = new pc.Entity(cfg.filename);
+        splat.addComponent('gsplat', { asset });
+        // .sog/.ply captures are authored Y-down; the 180° roll is the standard fix
+        splat.setLocalEulerAngles(0, 0, 180);
+        app.root.addChild(splat);
+
+        splat.gsplat.setWorkBufferModifier({ glsl: MODIFIER_GLSL });
+        splat.gsplat.workBufferUpdate = pc.WORKBUFFER_UPDATE_ALWAYS;
+
+        const renderMaterial = app.scene.gsplat.material;
+        renderMaterial.getShaderChunks(pc.SHADERLANGUAGE_GLSL).set('gsplatModifyPS', FRAGMENT_GLSL);
+        renderMaterial.update();
+
+        let bounds = measureSplatCloud(asset.resource, splat.getWorldTransform());
+        let pivot = bounds.pivot;
+        let extent = bounds.extent;
+        let height = bounds.size.y;
+        let width = Math.max(bounds.size.x, bounds.size.z);
+        let splatCount = asset.resource?.numSplats ?? 0;
+
+        // inflated so dispersed splats are never frustum-culled — Fibonacci Sphere
+        // reaches 3x the capture's width, further out than any other effect
+        let localAabb = asset.resource?.aabb
+            ?? new pc.BoundingBox(new pc.Vec3(), new pc.Vec3(1, 1, 1));
+        splat.gsplat.customAabb = new pc.BoundingBox(
+            localAabb.center.clone(),
+            localAabb.halfExtents.clone().mulScalar(8).add(new pc.Vec3(1, 1, 1))
+        );
+
+        camera.frame(pivot, extent, { ...cfg.camera.framing, snap: true });
+
+        // ------------------------------------------------------------ transition
+        // Looping is armed by the constructor: setting autoCycle leads with an In.
+        // The one-shot case has to ask for that same opening pass by hand, or the
+        // viewer would sit on the assembled capture and never play anything.
+        const transition = new Transition(cfg.transition);
+        if (!cfg.transition.autoCycle) transition.restartIn();
+
+        const toggle = () => transition.toggle();
+        window.addEventListener('keydown', (e) => {
+            if (e.key === ' ') { e.preventDefault(); toggle(); }
+        });
+        // a tap anywhere that is not a camera drag also toggles
+        let downAt = null;
+        canvas.addEventListener('pointerdown', (e) => { downAt = { x: e.clientX, y: e.clientY }; });
+        canvas.addEventListener('pointerup', (e) => {
+            if (!downAt) return;
+            const moved = Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y);
+            downAt = null;
+            if (moved < 6) toggle();
+        });
+
+        // ------------------------------------------------------------- main loop
+        let lastPointMode = null;
+        let elapsed = 0;
+
+        app.on('update', (dt) => {
+            elapsed += dt;
+            transition.update(dt);
+            camera.update(dt);
+
+            const { pointSize } = feedSplatUniforms(splat.gsplat, renderMaterial, {
+                time: elapsed,
+                progress: transition.progress,
+                effectIndex: cfg.effectIndex,
+                params: cfg.params,
+                splatCount,
+                pivot,
+                extent,
+                height,
+                width
+            });
+
+            // points are far smaller than the source gaussians, and the renderer's
+            // defaults would cull them
+            const pointMode = pointSize > 0;
+            if (pointMode !== lastPointMode) {
+                lastPointMode = pointMode;
+                app.scene.gsplat.minPixelSize = pointMode ? 0.5 : 2;
+                app.scene.gsplat.minContribution = pointMode ? 0 : 3;
+            }
+        });
+
+        app.start();
+        boot.classList.add('gone');
+
+        // The app exposes window.__demo for console poking and screenshot
+        // automation; the export gets the same courtesy, which is also the only way
+        // anything embedding this file can drive it from outside.
+        async function loadModel(file) {
+            if (!file || !/\.(sog|ply)$/i.test(file.name)) throw new Error('Formato admitido: .sog o .ply');
+            const objectUrl = URL.createObjectURL(file);
+            const next = new pc.Asset(file.name, 'gsplat', { url: objectUrl, filename: file.name });
+            next.urlObject = objectUrl;
+            app.assets.add(next);
+            try {
+                await new Promise((resolve, reject) => {
+                    next.once('load', resolve);
+                    next.once('error', e => reject(new Error(String(e))));
+                    app.assets.load(next);
+                });
+                const previous = asset;
+                splat.gsplat.asset = next;
+                asset = next;
+                cfg.filename = file.name;
+                splat.name = file.name;
+                bounds = measureSplatCloud(next.resource, splat.getWorldTransform());
+                pivot = bounds.pivot;
+                extent = bounds.extent;
+                height = bounds.size.y;
+                width = Math.max(bounds.size.x, bounds.size.z);
+                splatCount = next.resource?.numSplats ?? 0;
+                localAabb = next.resource?.aabb ?? new pc.BoundingBox(new pc.Vec3(), new pc.Vec3(1, 1, 1));
+                splat.gsplat.customAabb = new pc.BoundingBox(localAabb.center.clone(),
+                    localAabb.halfExtents.clone().mulScalar(8).add(new pc.Vec3(1, 1, 1)));
+                camera.frame(pivot, extent, { ...cfg.camera.framing, snap: true });
+                transition.reset();
+                previous.unload();
+                app.assets.remove(previous);
+                document.dispatchEvent(new CustomEvent('gscs-model', { detail: { filename: file.name, count: splatCount } }));
+                return { filename: file.name, splatCount };
+            } catch (err) {
+                app.assets.remove(next);
+                next.unload();
+                throw err;
+            }
+        }
+        window.__viewer = { app, pc, camera, transition, splat, cfg, loadModel,
+            shaders: { modifier: MODIFIER_GLSL, fragment: FRAGMENT_GLSL } };
+        document.dispatchEvent(new Event('gscs-ready'));
+
+        // the hint has said its piece by the time anyone has finished looking
+        setTimeout(() => document.getElementById('hint')?.classList.add('gone'), 6000);
+    }
+
+
+    await runViewer(pc, CFG, new Blob([splatBytes]));
+}
+
+main().catch(fail);
+</script>
+</body>
+</html>
